@@ -10,6 +10,8 @@ Drives zapret2's own scripts non-interactively:
   blockcheck DOMAIN...
                      run blockcheck2.sh in batch mode, turn the result into a
                      zapret2 profile, apply it and verify it on every domain
+  update             update zapret2 to the latest release, keeping the config and
+                     the method found (installs if zapret2 is missing)
   enable | disable   turn bypass on or off (also at boot)
   uninstall          remove zapret2 completely
 
@@ -376,8 +378,7 @@ def verify_sums(src, sums):
     log(f"verified {checked} files")
 
 
-def download_release(workdir):
-    event("step", id="download", text="Downloading zapret2")
+def latest_tag():
     try:
         final, _ = fetch(RELEASES + "/latest")
     except OSError as e:
@@ -385,6 +386,11 @@ def download_release(workdir):
     tag = final.rstrip("/").rsplit("/", 1)[-1]
     if not re.fullmatch(r"v[0-9][0-9A-Za-z.\-]*", tag):
         raise Fail("network", "Could not find the latest zapret2 release.")
+    return tag
+
+
+def download_release(workdir, tag):
+    event("step", id="download", text="Downloading zapret2 " + tag)
     name = f"zapret2-{tag}.tar.gz"
     tarball = os.path.join(workdir, name)
     log(f"latest release: {tag}")
@@ -409,7 +415,7 @@ def download_release(workdir):
     tops = [d for d in os.listdir(src) if os.path.isdir(os.path.join(src, d))]
     if len(tops) != 1 or not os.path.isfile(os.path.join(src, tops[0], "install_easy.sh")):
         raise Fail("checksum", "Unexpected zapret2 archive layout.")
-    return tag, os.path.join(src, tops[0])
+    return os.path.join(src, tops[0])
 
 
 def remove_existing():
@@ -449,43 +455,138 @@ def preset_config(src):
     return text
 
 
+def run_install_easy():
+    """Run install_easy.sh with stdin closed: every question takes the value
+    already in config as its answer."""
+    event("step", id="configure", text="Configuring zapret2 for this system")
+    env = dict(os.environ, EDITOR="true", VISUAL="true", TERM="dumb")
+    code, lines = stream(["sh", ZAPRET_DIR + "/install_easy.sh"], env=env, timeout=1200, cwd=ZAPRET_DIR)
+    text = "\n".join(lines)
+    if code != 0:
+        if "not either systemd, openrc or openwrt" in text:
+            raise Fail("unsupported", "Your system's service manager is not supported. "
+                                      "zapret2 needs systemd or OpenRC to start automatically.")
+        if "could not install prerequisites" in text or "supported package manager not found" in text:
+            raise Fail("prereq", "Required system packages could not be installed.")
+        if "build tools not found" in text or "could not compile" in text:
+            raise Fail("arch", "zapret2 has no ready-made program for this processor.")
+        raise Fail("install", f"zapret2 installer failed (code {code}).")
+    if not service_installed():
+        raise Fail("install", "zapret2 was installed but its service is missing.")
+
+
+def place_tree(src):
+    shutil.copytree(src, ZAPRET_DIR, symlinks=True)
+    run(["chown", "-R", "root:root", ZAPRET_DIR])
+    os.makedirs(ZAPRET_DIR + "/tmp", exist_ok=True)
+
+
 def cmd_install():
     event("step", id="prepare", text="Preparing")
     workdir = tempfile.mkdtemp(prefix="zapret2-gui-")
     try:
-        tag, src = download_release(workdir)
+        tag = latest_tag()
+        src = download_release(workdir, tag)
         event("step", id="install", text="Installing zapret2 " + tag)
         config = preset_config(src)
         if os.path.isdir(ZAPRET_DIR):
             remove_existing()
-        shutil.copytree(src, ZAPRET_DIR, symlinks=True)
-        run(["chown", "-R", "root:root", ZAPRET_DIR])
-        os.makedirs(ZAPRET_DIR + "/tmp", exist_ok=True)
+        place_tree(src)
         with open(CONFIG, "w") as f:
             f.write(config)
-
-        event("step", id="configure", text="Configuring zapret2 for this system")
-        env = dict(os.environ, EDITOR="true", VISUAL="true", TERM="dumb")
-        code, lines = stream(["sh", ZAPRET_DIR + "/install_easy.sh"], env=env, timeout=1200,
-                             cwd=ZAPRET_DIR)
-        text = "\n".join(lines)
-        if code != 0:
-            if "not either systemd, openrc or openwrt" in text:
-                raise Fail("unsupported", "Your system's service manager is not supported. "
-                                          "zapret2 needs systemd or OpenRC to start automatically.")
-            if "could not install prerequisites" in text or "supported package manager not found" in text:
-                raise Fail("prereq", "Required system packages could not be installed.")
-            if "build tools not found" in text or "could not compile" in text:
-                raise Fail("arch", "zapret2 has no ready-made program for this processor.")
-            raise Fail("install", f"zapret2 installer failed (code {code}).")
-        if not service_installed():
-            raise Fail("install", "zapret2 was installed but its service is missing.")
+        run_install_easy()
 
         state = load_state()
         state.update({"zapret_version": tag, "installed": int(time.time())})
         state.pop("strategy", None)
         save_state(state)
         event("done", message="zapret2 " + tag + " installed")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# Files install_easy.sh offers to keep when it replaces zapret2.
+KEEP = ("config", "init.d/sysv/custom.d", "ipset/zapret-hosts-user.txt",
+        "ipset/zapret-hosts-user-exclude.txt", "ipset/zapret-hosts-user-ipban.txt",
+        "ipset/zapret-hosts-auto.txt")
+
+
+def nfqws_options_valid():
+    """Check the configured options with the installed nfqws2, like install_easy does."""
+    opt = get_var(read_config(), "NFQWS2_OPT") or ""
+    opt = opt.replace("<HOSTLIST_NOAUTO>", "").replace("<HOSTLIST>", "")
+    nfqws = ZAPRET_DIR + "/nfq2/nfqws2"
+    if not os.access(nfqws, os.X_OK):
+        return True  # install_easy.sh will set up binaries and validate itself
+    r = run([nfqws, "--dry-run", "--qnum=300"] + opt.split(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def cmd_update():
+    """Update zapret2 to the latest release, keeping config, method and lists.
+
+    Falls back to a fresh install when zapret2 is missing or was not set up
+    by this app.
+    """
+    state = load_state()
+    if not zapret_installed() or not state.get("zapret_version"):
+        cmd_install()
+        return
+    event("step", id="prepare", text="Checking for zapret2 updates")
+    tag = latest_tag()
+    if tag == state["zapret_version"]:
+        log(f"zapret2 {tag} is up to date")
+        event("done", message=f"zapret2 {tag} is up to date", updated=False)
+        return
+
+    workdir = tempfile.mkdtemp(prefix="zapret2-gui-")
+    try:
+        src = download_release(workdir, tag)
+        event("step", id="install", text=f"Updating zapret2 {state['zapret_version']} to {tag}")
+        keep = os.path.join(workdir, "keep")
+        for rel in KEEP:
+            path = os.path.join(ZAPRET_DIR, rel)
+            dest = os.path.join(keep, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if os.path.isdir(path):
+                shutil.copytree(path, dest, symlinks=True)
+            elif os.path.isfile(path):
+                shutil.copy2(path, dest)
+        was_enabled = state.get("enabled", True)
+        service("stop")
+        shutil.rmtree(ZAPRET_DIR)
+        place_tree(src)
+        for rel in KEEP:
+            path, saved = os.path.join(ZAPRET_DIR, rel), os.path.join(keep, rel)
+            if os.path.isdir(saved):
+                shutil.rmtree(path, ignore_errors=True)
+                shutil.copytree(saved, path, symlinks=True)
+            elif os.path.isfile(saved):
+                shutil.copy2(saved, path)
+
+        # Put the new binaries in place, then make sure the saved method is
+        # still accepted. If not, fall back to zapret2's defaults.
+        run(["sh", ZAPRET_DIR + "/install_bin.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=ZAPRET_DIR)
+        reset = False
+        if not nfqws_options_valid():
+            log("the saved method is not accepted by the new zapret2, using defaults")
+            with open(CONFIG_DEFAULT) as f:
+                default_opt = get_var(f.read(), "NFQWS2_OPT") or ""
+            write_config(set_var(read_config(), "NFQWS2_OPT", '"' + default_opt + '"'))
+            state.pop("strategy", None)
+            reset = True
+        run_install_easy()
+        if not was_enabled:
+            service("stop")
+            service("disable")
+        state["zapret_version"] = tag
+        save_state(state)
+        msg = f"zapret2 updated to {tag}"
+        if reset:
+            msg += ". Please find a working method again."
+        event("done", message=msg, updated=True, reset=reset)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -757,7 +858,7 @@ def main(argv):
     if os.geteuid() != 0:
         print("must run as root", file=sys.stderr)
         return 2
-    if not args or args[0] not in ("install", "blockcheck", "enable", "disable", "uninstall"):
+    if not args or args[0] not in ("install", "update", "blockcheck", "enable", "disable", "uninstall"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     os.umask(0o022)
@@ -772,6 +873,8 @@ def main(argv):
         try:
             if cmd == "install":
                 cmd_install()
+            elif cmd == "update":
+                cmd_update()
             elif cmd == "blockcheck":
                 cmd_blockcheck(args[1:])
             elif cmd == "enable":

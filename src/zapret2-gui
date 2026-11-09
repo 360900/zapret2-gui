@@ -521,7 +521,7 @@ class Window(Adw.ApplicationWindow):
         header.set_decoration_layout(":close")
         header.set_title_widget(Adw.WindowTitle(title=APP_NAME))
         menu = Gio.Menu()
-        menu.append("Reinstall zapret2", "win.reinstall")
+        menu.append("Update zapret2", "win.update")
         menu.append("About", "win.about")
         self.menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
                                           tooltip_text="Menu")
@@ -534,7 +534,7 @@ class Window(Adw.ApplicationWindow):
         self.toasts.set_child(outer)
         self.set_content(self.toasts)
 
-        for name, fn in (("reinstall", self.on_reinstall), ("about", self.on_about)):
+        for name, fn in (("update", self.on_update), ("about", self.on_about)):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", lambda *_a, f=fn: f())
             self.add_action(act)
@@ -800,6 +800,8 @@ class Window(Adw.ApplicationWindow):
     def _err_action(self):
         if self.err_action == "install":
             self.start_install()
+        elif self.err_action == "update":
+            self.on_update()
         elif self.err_action == "retry" and any(e.get_text().strip() for e in self.entries):
             self.start_blockcheck()
         else:
@@ -831,7 +833,7 @@ class Window(Adw.ApplicationWindow):
         self.cancel_btn.set_sensitive(True)
         self.cancel_btn.set_label("Cancel")
         self.cancel_btn.set_visible(task != "toggle")
-        self.work_note.set_visible(task in ("install", "blockcheck"))
+        self.work_note.set_visible(task in ("install", "update", "blockcheck"))
         self.menu_button.set_sensitive(False)
         self.stack.set_visible_child_name("working")
         try:
@@ -957,6 +959,9 @@ class Window(Adw.ApplicationWindow):
             if task == "install":
                 self.toast("Setup complete")
                 self.show_welcome(first=True)
+            elif task == "update":
+                self.toast(run.done.get("message", "Done"))
+                self.refresh()
             elif task == "blockcheck":
                 failing, total = run.done.get("failing") or [], len(run.done.get("domains") or [])
                 if failing:
@@ -972,8 +977,8 @@ class Window(Adw.ApplicationWindow):
 
         code = (err or {}).get("code", "")
         msg = (err or {}).get("message") or "Something went wrong. Open Details for more information."
-        if task == "install":
-            self.show_error("Setup failed", msg, action="install")
+        if task in ("install", "update"):
+            self.show_error("Setup failed" if task == "install" else "Update failed", msg, action=task)
         elif task == "blockcheck":
             titles = {"unblocked": ("Nothing to unblock", "welcome", "dialog-information-symbolic"),
                       "notfound": ("No working method found", "welcome", "dialog-warning-symbolic"),
@@ -991,13 +996,10 @@ class Window(Adw.ApplicationWindow):
 
     # ---------------------------------------------------------- menu & close
 
-    def on_reinstall(self):
+    def on_update(self):
         if self.run:
             return
-        self._confirm("Reinstall zapret2?",
-                      "This downloads the latest zapret2 and sets it up again. "
-                      "You will need to find a working method again afterwards.",
-                      "Reinstall", self.start_install)
+        self._begin("update", ["update"], "Checking for zapret2 updates")
 
     def on_about(self):
         if hasattr(Adw, "AboutDialog"):
@@ -1020,7 +1022,7 @@ class Window(Adw.ApplicationWindow):
         d.add_response("cancel", "Cancel")
         d.add_response("ok", ok)
         d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE
-                                  if ok in ("Stop", "Reinstall") else Adw.ResponseAppearance.SUGGESTED)
+                                  if ok == "Stop" else Adw.ResponseAppearance.SUGGESTED)
         d.set_default_response("cancel")
         d.set_close_response("cancel")
         d.connect("response", lambda _d, r: callback() if r == "ok" else None)
@@ -1039,7 +1041,7 @@ class Window(Adw.ApplicationWindow):
         return False
 
     def busy(self):
-        return bool(self.run and self.task in ("install", "blockcheck") and not self.run.cancelled)
+        return bool(self.run and self.task in ("install", "update", "blockcheck") and not self.run.cancelled)
 
     def confirm_quit(self):
         def stop_and_quit():

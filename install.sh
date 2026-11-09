@@ -1,6 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Installs Zapret2 GUI and zapret2, then opens the app.
+# Run again to update: the app is replaced and zapret2 is updated to the latest
+# release, keeping its config and the method found.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -74,7 +76,19 @@ if [ -n "$(missing_deps)" ]; then
 	[ -z "$(missing_deps)" ] || die "still missing after install: $(missing_deps | xargs)"
 fi
 
-say "Installing Zapret2 GUI"
+# An existing setup made by this app is updated, not reinstalled.
+UPDATE=
+[ -f /var/lib/zapret2-gui/state.json ] && [ -f /opt/zapret2/config ] && UPDATE=1
+
+# Close a running app so it restarts with the new version.
+APP_PATTERN='python3 -I [^ ]*/zapret2-gui( |$)'
+pkill -f "$APP_PATTERN" 2>/dev/null || true
+
+if [ -n "$UPDATE" ]; then
+	say "Updating Zapret2 GUI"
+else
+	say "Installing Zapret2 GUI"
+fi
 $SUDO install -d -m 755 "$APP_DIR"
 $SUDO install -m 755 "$HERE/src/zapret2-gui" "$APP_DIR/zapret2-gui"
 $SUDO install -m 755 "$HERE/src/zapret2-gui-helper" "$APP_DIR/zapret2-gui-helper"
@@ -90,12 +104,17 @@ $SUDO install -m 644 "$HERE/data/org.zapret2gui.policy" "$POLICY"
 have update-desktop-database && $SUDO update-desktop-database -q /usr/share/applications 2>/dev/null || true
 have gtk-update-icon-cache && $SUDO gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 
-say "Installing and configuring zapret2"
-$SUDO "$APP_DIR/zapret2-gui-helper" --plain install || die "zapret2 setup failed. See the messages above."
+if [ -n "$UPDATE" ]; then
+	say "Updating zapret2"
+	$SUDO "$APP_DIR/zapret2-gui-helper" --plain update || die "zapret2 update failed. See the messages above."
+	say "Done. Zapret2 is up to date."
+else
+	say "Installing and configuring zapret2"
+	$SUDO "$APP_DIR/zapret2-gui-helper" --plain install || die "zapret2 setup failed. See the messages above."
+	say "Done. Zapret2 is in your app menu."
+fi
 
-say "Done. Zapret2 is in your app menu."
-
-# Open the app for the first run, as the desktop user.
+# Open the app, as the desktop user.
 if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] && [ "$(id -u)" != 0 ]; then
 	say "Opening Zapret2"
 	if have setsid; then

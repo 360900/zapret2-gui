@@ -51,6 +51,14 @@ cd zapret2-gui
 
 Or download `zapret2-gui-<version>.tar.gz` from the releases page, unpack it and run `./install.sh`.
 
+### Update
+
+- **Packages**: update with your package manager as usual (AUR helper, `apt upgrade`, `dnf upgrade`).
+- **Install script**: run `git pull && ./install.sh` again.
+- **zapret2 itself**: choose **Update zapret2** in the app menu. The install script does this automatically.
+
+Updating keeps your settings, websites and the method found. If a new zapret2 no longer accepts the saved method, the app asks you to find a new one.
+
 ### Requirements
 
 - Linux with systemd or OpenRC
@@ -85,6 +93,7 @@ Uninstalling also stops and removes zapret2 and its firewall rules. Dependencies
 
 ## How it works
 
+- **Updating zapret2** replaces it with the latest release but keeps its config, host lists and custom scripts, the same files `install_easy.sh` offers to keep, then runs `install_easy.sh` again. The saved method is checked with the new `nfqws2 --dry-run` first.
 - **Setup** downloads the latest zapret2 release, verifies its binaries against the release checksums and runs zapret2's `install_easy.sh` with every answer preset: nfqws2 on, autohostlist filtering, firewall type detected by zapret2, IPv6 only if it works, no list downloads, no flow offloading.
 - **Finding a method** pauses zapret2 and runs `blockcheck2.sh` in batch mode at the `veryquick` scan level against HTTPS (TLS 1.2, then TLS 1.3 if nothing works). It only runs for the first website that is actually blocked, so extra websites don't slow it down. Each method found is then applied to zapret2 and checked against all websites in parallel; the first one that opens all of them is kept, otherwise the one that opens the most. The websites are added to zapret2's user host list. HTTP and QUIC keep zapret2's default methods.
 - **Cancel**, or closing the window, stops the test and restores the previous settings.
@@ -110,7 +119,7 @@ Uninstalling also stops and removes zapret2 and its firewall rules. Dependencies
 
 ```
 src/zapret2-gui            GTK 4 / libadwaita app with tray icon (Python)
-src/zapret2-gui-helper     root helper: install, blockcheck, enable, disable, uninstall
+src/zapret2-gui-helper     root helper: install, update, blockcheck, enable, disable, uninstall
 data/                      desktop and autostart entries, icons, polkit policy
 install.sh, uninstall.sh   script install for any distro
 packaging/nfpm.yaml        deb, rpm, Arch and Alpine packages

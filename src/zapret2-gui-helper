@@ -1,0 +1,716 @@
+#!/usr/bin/python3 -I
+"""Privileged helper for Zapret2 GUI.
+
+Runs as root (through pkexec from the GUI, or sudo from install.sh/uninstall.sh).
+Drives zapret2's own scripts non-interactively:
+
+  install            download the latest zapret2 release and run install_easy.sh
+                     with every answer preset for this system
+  blockcheck DOMAIN  run blockcheck2.sh in batch mode, turn the result into a
+                     zapret2 profile, apply it and verify it
+  enable | disable   turn bypass on or off (also at boot)
+  uninstall          remove zapret2 completely
+
+Output: human readable log lines, plus machine events as lines starting with
+"@" followed by JSON. --plain hides the events (for terminals).
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+ZAPRET_DIR = "/opt/zapret2"
+CONFIG = ZAPRET_DIR + "/config"
+CONFIG_DEFAULT = ZAPRET_DIR + "/config.default"
+USER_HOSTLIST = ZAPRET_DIR + "/ipset/zapret-hosts-user.txt"
+STATE_DIR = "/var/lib/zapret2-gui"
+STATE_FILE = STATE_DIR + "/state.json"
+LOCK_FILE = "/run/zapret2-gui.lock"
+RELEASES = "https://github.com/bol-van/zapret2/releases"
+UA = "zapret2-gui"
+
+# Fallbacks if config.default ever stops shipping these lines.
+DEFAULT_HTTP = "--payload=http_req --lua-desync=fake:blob=fake_default_http:tcp_md5 --lua-desync=multisplit:pos=method+2"
+DEFAULT_TLS = "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld"
+DEFAULT_QUIC = "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6"
+
+# Characters a blockcheck strategy may contain. Anything else is rejected
+# before it gets near a shell-sourced config file.
+SAFE_STRATEGY = re.compile(r"^[A-Za-z0-9_=:,.<>@/+\-~ ]+$")
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$")
+
+PLAIN = False
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+os.environ.setdefault("LANG", "C.UTF-8")
+
+
+class Fail(Exception):
+    """Expected failure with a code the GUI understands."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class Aborted(Exception):
+    """The GUI went away (closed pipe) or we got a termination signal."""
+
+
+# ---------------------------------------------------------------- output
+
+def out(line):
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        raise Aborted()
+
+
+def log(text):
+    out(text)
+
+
+def event(kind, **data):
+    if PLAIN:
+        if kind == "step":
+            out("==> " + data.get("text", data.get("id", "")))
+        elif kind in ("done", "error"):
+            out(("Done: " if kind == "done" else "Error: ") + data.get("message", ""))
+        return
+    data["event"] = kind
+    out("@" + json.dumps(data, ensure_ascii=False))
+
+
+def _on_signal(signum, frame):
+    raise Aborted()
+
+
+# ---------------------------------------------------------------- state
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE_FILE)
+
+
+# ---------------------------------------------------------------- system
+
+def run(cmd, check=False, **kw):
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, check=check, **kw)
+
+
+def has_systemd():
+    return os.path.isdir("/run/systemd/system") and shutil.which("systemctl")
+
+
+def stream(cmd, env=None, timeout=None, on_line=None, cwd=None):
+    """Run cmd, forwarding its output line by line. Returns (exit code, lines)."""
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=env, cwd=cwd,
+                            start_new_session=True, text=True, errors="replace", bufsize=1)
+    lines = []
+    deadline = time.monotonic() + timeout if timeout else None
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            lines.append(line)
+            log(line)
+            if on_line:
+                on_line(line)
+            if deadline and time.monotonic() > deadline:
+                raise Fail("timeout", "The operation took too long and was stopped.")
+        proc.wait()
+    except BaseException:
+        # SIGTERM lets blockcheck2.sh run its own cleanup trap (removes its
+        # firewall rules and kills its nfqws2 instance).
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        raise
+    return proc.returncode, lines
+
+
+def zapret_installed():
+    return os.path.isfile(ZAPRET_DIR + "/install_easy.sh") and os.path.isfile(CONFIG)
+
+
+def service_installed():
+    if has_systemd():
+        return any(os.path.isfile(d + "/zapret2.service")
+                   for d in ("/etc/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system"))
+    return os.path.exists("/etc/init.d/zapret2")
+
+
+def service(action):
+    """action: start, stop, enable, disable. Returns True on success."""
+    if has_systemd():
+        return run(["systemctl", action, "zapret2"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL).returncode == 0
+    init = "/etc/init.d/zapret2"
+    if not os.path.exists(init):
+        return False
+    if action in ("enable", "disable"):
+        if shutil.which("rc-update"):
+            verb = "add" if action == "enable" else "del"
+            return run(["rc-update", verb, "zapret2"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL).returncode == 0
+        return run([init, action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    return run([init, action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def nfqws_running():
+    return run(["pgrep", "-x", "nfqws2"], stdout=subprocess.DEVNULL).returncode == 0
+
+
+def service_restart_checked():
+    service("stop")
+    if not service("start"):
+        return False
+    for _ in range(10):
+        if nfqws_running():
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def ipv6_works():
+    for host in ("2606:4700:4700::1111", "2001:4860:4860::8888"):
+        try:
+            with socket.create_connection((host, 443), timeout=3):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------- config
+
+def read_config():
+    with open(CONFIG) as f:
+        return f.read()
+
+
+def write_config(text):
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, CONFIG)
+
+
+def set_var(text, name, value):
+    """Set NAME=value in a zapret config, uncommenting it if needed."""
+    line = f"{name}={value}"
+    pat = re.compile(rf"^[ \t]*#?[ \t]*{name}=(\"[^\"]*\"|[^\n]*)$", re.M)
+    if pat.search(text):
+        return pat.sub(lambda m: line, text, count=1)
+    return text.rstrip("\n") + "\n" + line + "\n"
+
+
+def get_var(text, name):
+    m = re.search(rf"^[ \t]*{name}=(\"([^\"]*)\"|([^\n]*))$", text, re.M)
+    if not m:
+        return None
+    return m.group(2) if m.group(2) is not None else m.group(3).strip()
+
+
+def default_strategies():
+    """HTTP and QUIC strategies from zapret2's own config.default."""
+    http, quic = DEFAULT_HTTP, DEFAULT_QUIC
+    try:
+        with open(CONFIG_DEFAULT) as f:
+            opt = get_var(f.read(), "NFQWS2_OPT") or ""
+    except OSError:
+        opt = ""
+    for line in opt.splitlines():
+        body = re.sub(r"\s*--new\s*$", "", line.strip())
+        m = re.search(r"<HOSTLIST(?:_NOAUTO)?>\s+(.+)$", body)
+        if not m:
+            continue
+        if "--filter-tcp=80 " in body and "--filter-l7=http " in body:
+            http = m.group(1)
+        elif "--filter-udp=443 " in body and "--filter-l7=quic " in body:
+            quic = m.group(1)
+    return http, quic
+
+
+def ipv6_variant(strategy):
+    """blockcheck tests over IPv4, so TTL foolings come out as ip_ttl/ip_autottl.
+    Those only touch IPv4 packets; add the IPv6 equivalents next to them."""
+    return re.sub(r"(?<![0-9A-Za-z_])ip_(ttl|autottl)=([^:\s]+)",
+                  lambda m: f"ip_{m.group(1)}={m.group(2)}:ip6_{m.group(1)}={m.group(2)}", strategy)
+
+
+def build_opt(tls_strategy, ipv6):
+    http, quic = default_strategies()
+    tls = ipv6_variant(tls_strategy) if ipv6 else tls_strategy
+    return ("\n"
+            f"--filter-tcp=80 --filter-l7=http <HOSTLIST> {http} --new\n"
+            f"--filter-tcp=443 --filter-l7=tls <HOSTLIST> {tls} --new\n"
+            f"--filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> {quic}\n")
+
+
+def apply_profile(tls_strategy):
+    text = read_config()
+    ipv6 = get_var(text, "DISABLE_IPV6") != "1"
+    text = set_var(text, "NFQWS2_ENABLE", "1")
+    text = set_var(text, "MODE_FILTER", "autohostlist")
+    text = set_var(text, "NFQWS2_OPT", '"' + build_opt(tls_strategy, ipv6) + '"')
+    write_config(text)
+
+
+def add_user_domain(domain):
+    try:
+        with open(USER_HOSTLIST) as f:
+            entries = [l.strip() for l in f if l.strip()]
+    except OSError:
+        entries = []
+    entries = [e for e in entries if e != "nonexistent.domain"]
+    if domain not in entries:
+        entries.append(domain)
+    with open(USER_HOSTLIST, "w") as f:
+        f.write("\n".join(entries) + "\n")
+
+
+# ---------------------------------------------------------------- locking
+
+def take_lock():
+    fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Fail("busy", "Another Zapret2 task is already running.")
+    return fd
+
+
+# ---------------------------------------------------------------- install
+
+def fetch(url, dest=None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if dest is None:
+            return r.geturl(), r.read()
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+        return r.geturl(), None
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_sums(src, sums):
+    """The release's sha256sum.txt lists every prebuilt binary. Check them all."""
+    checked = 0
+    for line in sums.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, rel = parts[0].lower(), parts[1].strip().lstrip("*")
+        if ".." in rel.split("/") or rel.startswith("/"):
+            continue
+        path = os.path.join(src, rel)
+        if not os.path.isfile(path) or sha256_file(path) != digest:
+            raise Fail("checksum", "The downloaded zapret2 archive is damaged. Please try again.")
+        checked += 1
+    if not checked:
+        raise Fail("checksum", "Could not verify the downloaded zapret2 archive.")
+    log(f"verified {checked} files")
+
+
+def download_release(workdir):
+    event("step", id="download", text="Downloading zapret2")
+    try:
+        final, _ = fetch(RELEASES + "/latest")
+    except OSError as e:
+        raise Fail("network", f"Could not reach GitHub to download zapret2 ({e}).")
+    tag = final.rstrip("/").rsplit("/", 1)[-1]
+    if not re.fullmatch(r"v[0-9][0-9A-Za-z.\-]*", tag):
+        raise Fail("network", "Could not find the latest zapret2 release.")
+    name = f"zapret2-{tag}.tar.gz"
+    tarball = os.path.join(workdir, name)
+    log(f"latest release: {tag}")
+    try:
+        _, sums = fetch(f"{RELEASES}/download/{tag}/sha256sum.txt")
+        fetch(f"{RELEASES}/download/{tag}/{name}", tarball)
+    except OSError as e:
+        raise Fail("network", f"Downloading zapret2 failed ({e}).")
+    log("downloaded")
+
+    src = os.path.join(workdir, "src")
+    os.mkdir(src)
+    with tarfile.open(tarball) as t:
+        if hasattr(tarfile, "data_filter"):
+            t.extractall(src, filter="data")
+        else:
+            for m in t.getmembers():
+                if m.name.startswith("/") or ".." in m.name.split("/"):
+                    raise Fail("checksum", "Unexpected file in zapret2 archive.")
+            t.extractall(src)
+    verify_sums(src, sums.decode(errors="replace"))
+    tops = [d for d in os.listdir(src) if os.path.isdir(os.path.join(src, d))]
+    if len(tops) != 1 or not os.path.isfile(os.path.join(src, tops[0], "install_easy.sh")):
+        raise Fail("checksum", "Unexpected zapret2 archive layout.")
+    return tag, os.path.join(src, tops[0])
+
+
+def remove_existing():
+    """Stop and remove an existing /opt/zapret2 the way its own uninstaller does."""
+    if not os.path.isdir(ZAPRET_DIR):
+        return
+    log("removing previous zapret2 installation")
+    if os.path.isfile(CONFIG):
+        os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+        shutil.copy2(CONFIG, STATE_DIR + "/config.before-gui")
+    if os.path.isfile(ZAPRET_DIR + "/uninstall_easy.sh"):
+        stream(["sh", ZAPRET_DIR + "/uninstall_easy.sh"], timeout=180)
+    shutil.rmtree(ZAPRET_DIR)
+
+
+def preset_config(src):
+    """Write the answers install_easy.sh would ask for into config.
+
+    install_easy.sh uses the current config values as the default answer to
+    every question, so with these preset and stdin closed it takes exactly
+    these choices. FWTYPE is left unset so zapret2 detects nftables/iptables
+    itself, same as pressing Enter at that prompt.
+    """
+    with open(os.path.join(src, "config.default")) as f:
+        text = f.read()
+    ipv6 = ipv6_works()
+    log(f"ipv6 connectivity: {'yes' if ipv6 else 'no'}")
+    for name, value in (
+        ("NFQWS2_ENABLE", "1"),
+        ("MODE_FILTER", "autohostlist"),
+        ("FLOWOFFLOAD", "none"),
+        ("DISABLE_IPV6", "0" if ipv6 else "1"),
+        ("GETLIST", ""),
+        ("INIT_APPLY_FW", "1"),
+    ):
+        text = set_var(text, name, value)
+    return text
+
+
+def cmd_install():
+    event("step", id="prepare", text="Preparing")
+    workdir = tempfile.mkdtemp(prefix="zapret2-gui-")
+    try:
+        tag, src = download_release(workdir)
+        event("step", id="install", text="Installing zapret2 " + tag)
+        config = preset_config(src)
+        if os.path.isdir(ZAPRET_DIR):
+            remove_existing()
+        shutil.copytree(src, ZAPRET_DIR, symlinks=True)
+        run(["chown", "-R", "root:root", ZAPRET_DIR])
+        os.makedirs(ZAPRET_DIR + "/tmp", exist_ok=True)
+        with open(CONFIG, "w") as f:
+            f.write(config)
+
+        event("step", id="configure", text="Configuring zapret2 for this system")
+        env = dict(os.environ, EDITOR="true", VISUAL="true", TERM="dumb")
+        code, lines = stream(["sh", ZAPRET_DIR + "/install_easy.sh"], env=env, timeout=1200,
+                             cwd=ZAPRET_DIR)
+        text = "\n".join(lines)
+        if code != 0:
+            if "not either systemd, openrc or openwrt" in text:
+                raise Fail("unsupported", "Your system's service manager is not supported. "
+                                          "zapret2 needs systemd or OpenRC to start automatically.")
+            if "could not install prerequisites" in text or "supported package manager not found" in text:
+                raise Fail("prereq", "Required system packages could not be installed.")
+            if "build tools not found" in text or "could not compile" in text:
+                raise Fail("arch", "zapret2 has no ready-made program for this processor.")
+            raise Fail("install", f"zapret2 installer failed (code {code}).")
+        if not service_installed():
+            raise Fail("install", "zapret2 was installed but its service is missing.")
+
+        state = load_state()
+        state.update({"zapret_version": tag, "installed": int(time.time())})
+        state.pop("strategy", None)
+        save_state(state)
+        event("done", message="zapret2 " + tag + " installed")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- blockcheck
+
+def normalize_domain(raw):
+    d = raw.strip().lower()
+    d = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", d)
+    d = d.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    d = d.rsplit("@", 1)[-1]
+    d = re.sub(r":\d+$", "", d).strip(".")
+    try:
+        d = d.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    return d if DOMAIN_RE.match(d) else None
+
+
+def run_blockcheck(domain, test, on_tested):
+    """Run blockcheck2.sh for one TLS test. Returns a dict describing the outcome."""
+    env = dict(os.environ,
+               BATCH="1", TEST="standard", DOMAINS=domain, IPVS="4",
+               ENABLE_HTTP="0", ENABLE_HTTP3="0",
+               ENABLE_HTTPS_TLS12="1" if test == "tls12" else "0",
+               ENABLE_HTTPS_TLS13="1" if test == "tls13" else "0",
+               REPEATS="1", PARALLEL="0", SCANLEVEL="veryquick", SKIP_IPBLOCK="1")
+    tf = "curl_test_https_" + test
+    tested = re.compile(rf"^- {tf} ipv4 ")
+
+    def on_line(line):
+        if tested.match(line):
+            on_tested()
+
+    code, lines = stream(["sh", ZAPRET_DIR + "/blockcheck2.sh"], env=env, timeout=3600,
+                         on_line=on_line, cwd=ZAPRET_DIR)
+    res = {"code": code, "strategies": [], "unblocked": False, "aborted": None,
+           "dns_spoofed": any("POSSIBLE DNS HIJACK DETECTED" in l for l in lines),
+           "tls_unsupported": any("curl version does not support TLS 1.3" in l for l in lines)}
+    try:
+        start = len(lines) - 1 - lines[::-1].index("* SUMMARY")
+    except ValueError:
+        tail = [l for l in lines if l.strip()][-3:]
+        raise Fail("blockcheck", "The test stopped unexpectedly: " + (" ".join(tail) or f"code {code}"))
+    prefix = f"{tf} ipv4 {domain} : "
+    for line in lines[start + 1:]:
+        if not line.startswith(prefix):
+            continue
+        val = line[len(prefix):].strip()
+        if val == "working without bypass":
+            res["unblocked"] = True
+        elif val.startswith("test aborted"):
+            res["aborted"] = val
+        elif val.startswith("nfqws2 ") and not val.endswith("not working"):
+            s = val[len("nfqws2 "):].strip()
+            if SAFE_STRATEGY.match(s) and s not in res["strategies"]:
+                res["strategies"].append(s)
+    return res
+
+
+def site_reachable(domain):
+    r = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "8", "--retry", "1",
+             "-A", "Mozilla", "https://" + domain + "/"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 0 = any HTTP answer. 22 can't happen without -f. Other codes = blocked.
+    return r.returncode == 0
+
+
+def cmd_blockcheck(raw_domain):
+    domain = normalize_domain(raw_domain)
+    if not domain:
+        raise Fail("domain", "That doesn't look like a website address. Try something like example.com.")
+    if not zapret_installed():
+        raise Fail("missing", "zapret2 is not installed.")
+    for tools in (("curl",), ("nslookup", "host")):
+        if not any(shutil.which(t) for t in tools):
+            raise Fail("prereq", f"The program '{tools[0]}' is missing. Run install.sh again to fix this.")
+
+    previous = read_config()
+    state = load_state()
+    was_running = nfqws_running()
+    restored = False
+
+    def restore():
+        nonlocal restored
+        if restored:
+            return
+        restored = True
+        write_config(previous)
+        if was_running:
+            service("start")
+
+    event("step", id="stop", text="Pausing bypass while testing")
+    service("stop")
+    # blockcheck needs every bypass off. Our own nfqws2 only; never touch others.
+    time.sleep(0.5)
+
+    tested = [0]
+
+    def on_tested():
+        tested[0] += 1
+        event("progress", tested=tested[0])
+
+    try:
+        event("step", id="search", text="Looking for a method that works for " + domain)
+        res = run_blockcheck(domain, "tls12", on_tested)
+        if not res["strategies"] and not res["unblocked"] and not res["aborted"]:
+            event("step", id="search13", text="Trying more methods")
+            res13 = run_blockcheck(domain, "tls13", on_tested)
+            if not res13["tls_unsupported"]:
+                res13["dns_spoofed"] = res13["dns_spoofed"] or res["dns_spoofed"]
+                res = res13
+
+        if res["unblocked"]:
+            raise Fail("unblocked", f"{domain} opens fine without any help, so there is nothing to find. "
+                                    "Enter a website that does not open for you.")
+        if res["aborted"]:
+            m = re.search(r"curl code (\d+)", res["aborted"])
+            code = int(m.group(1)) if m else 0
+            if code == 6:
+                raise Fail("resolve", f"{domain} could not be found. Check the address for typos.")
+            raise Fail("unreachable", f"{domain} could not be reached at all. "
+                                      "Check your internet connection or try another website.")
+        if not res["strategies"]:
+            raise Fail("notfound", "No working method was found for " + domain + ". "
+                                   "Your provider may block it by address, which zapret2 cannot bypass.")
+
+        event("step", id="apply", text="Applying and checking")
+        add_user_domain(domain)
+        chosen = None
+        for strategy in res["strategies"][:5]:
+            log("trying: " + strategy)
+            apply_profile(strategy)
+            if not service_restart_checked():
+                log("service did not start with this method")
+                continue
+            if site_reachable(domain):
+                chosen = strategy
+                break
+            log(f"{domain} still not reachable with this method")
+        if not chosen:
+            # The site may just be slow to answer curl, or DNS is tampered with.
+            # Keep the best candidate running when it at least starts.
+            apply_profile(res["strategies"][0])
+            if service_restart_checked():
+                chosen = res["strategies"][0]
+        if not chosen:
+            raise Fail("notfound", "A method was found but could not be applied. Please try again.")
+
+        service("enable")
+        restored = True
+        state.update({"strategy": chosen, "domain": domain, "updated": int(time.time()),
+                      "enabled": True, "dns_spoofed": bool(res["dns_spoofed"])})
+        save_state(state)
+        event("done", message="Working method applied", domain=domain, strategy=chosen,
+              dns_spoofed=bool(res["dns_spoofed"]))
+    finally:
+        if not restored:
+            restore()
+
+
+# ---------------------------------------------------------------- on/off
+
+def cmd_enable():
+    if not zapret_installed():
+        raise Fail("missing", "zapret2 is not installed.")
+    service("enable")
+    if not service_restart_checked():
+        raise Fail("service", "zapret2 could not be started.")
+    state = load_state()
+    state["enabled"] = True
+    save_state(state)
+    event("done", message="Bypass is on")
+
+
+def cmd_disable():
+    service("stop")
+    service("disable")
+    state = load_state()
+    state["enabled"] = False
+    save_state(state)
+    event("done", message="Bypass is off")
+
+
+def cmd_uninstall():
+    event("step", id="uninstall", text="Removing zapret2")
+    if os.path.isdir(ZAPRET_DIR):
+        service("stop")
+        remove_existing()
+    for unit in ("zapret2.service", "zapret2-list-update.service", "zapret2-list-update.timer"):
+        for d in ("/etc/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system"):
+            p = os.path.join(d, unit)
+            if os.path.isfile(p):
+                os.remove(p)
+    if os.path.islink("/etc/init.d/zapret2"):
+        os.remove("/etc/init.d/zapret2")
+    if has_systemd():
+        run(["systemctl", "daemon-reload"])
+    shutil.rmtree(STATE_DIR, ignore_errors=True)
+    event("done", message="zapret2 removed")
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    global PLAIN
+    args = [a for a in argv if a != "--plain"]
+    PLAIN = len(args) != len(argv)
+    if os.geteuid() != 0:
+        print("must run as root", file=sys.stderr)
+        return 2
+    if not args or args[0] not in ("install", "blockcheck", "enable", "disable", "uninstall"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    os.umask(0o022)
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, _on_signal)
+    # Writing to a closed pipe must raise, not kill us before cleanup.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+    cmd = args[0]
+    try:
+        lock = take_lock()
+        try:
+            if cmd == "install":
+                cmd_install()
+            elif cmd == "blockcheck":
+                if len(args) != 2:
+                    raise Fail("domain", "No website given.")
+                cmd_blockcheck(args[1])
+            elif cmd == "enable":
+                cmd_enable()
+            elif cmd == "disable":
+                cmd_disable()
+            elif cmd == "uninstall":
+                cmd_uninstall()
+        finally:
+            os.close(lock)
+        return 0
+    except Fail as e:
+        try:
+            event("error", code=e.code, message=str(e))
+        except Aborted:
+            pass
+        return 1
+    except Aborted:
+        # stdout is a dead pipe; keep the interpreter from failing on exit flush.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

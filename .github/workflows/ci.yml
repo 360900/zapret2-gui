@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install linters
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck desktop-file-utils libxml2-utils
+      - name: Shell scripts
+        run: shellcheck -s sh install.sh uninstall.sh packaging/*.sh packaging/scripts/*.sh packaging/arch/update-aur.sh
+      - name: Python
+        run: |
+          for f in src/zapret2-gui src/zapret2-gui-helper; do
+            python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])" "$f"
+          done
+      - name: Desktop entry and polkit policy
+        run: |
+          desktop-file-validate data/zapret2-gui.desktop
+          xmllint --noout data/org.zapret2gui.policy data/zapret2-gui.svg
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tag matches version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' src/zapret2-gui)"
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match VERSION $version"; exit 1; }
+      - name: Build packages
+        run: packaging/build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {image: 'debian:12', kind: deb}
+          - {image: 'debian:13', kind: deb}
+          - {image: 'ubuntu:24.04', kind: deb}
+          - {image: 'fedora:latest', kind: rpm-dnf}
+          - {image: 'opensuse/tumbleweed:latest', kind: rpm-zypper}
+          - {image: 'archlinux:latest', kind: arch}
+          - {image: 'alpine:latest', kind: apk}
+    name: test (${{ matrix.image }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: Install, check and remove package
+        run: docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/packaging:/p:ro" "${{ matrix.image }}" sh /p/test-package.sh "${{ matrix.kind }}" /dist
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: Publish to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
+          git clone ssh://aur@aur.archlinux.org/zapret2-gui.git aur
+          packaging/arch/update-aur.sh "$version" "dist/zapret2-gui-$version.tar.gz" "$PWD/aur"
+          cd aur
+          git config user.name "${{ github.repository_owner }}"
+          git config user.email "${{ github.repository_owner }}@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO zapret2-gui.install
+          git diff --cached --quiet || git commit -m "Update to $version"
+          git push origin HEAD:master

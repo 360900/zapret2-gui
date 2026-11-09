@@ -7,8 +7,9 @@ Drives zapret2's own scripts non-interactively:
 
   install            download the latest zapret2 release and run install_easy.sh
                      with every answer preset for this system
-  blockcheck DOMAIN  run blockcheck2.sh in batch mode, turn the result into a
-                     zapret2 profile, apply it and verify it
+  blockcheck DOMAIN...
+                     run blockcheck2.sh in batch mode, turn the result into a
+                     zapret2 profile, apply it and verify it on every domain
   enable | disable   turn bypass on or off (also at boot)
   uninstall          remove zapret2 completely
 
@@ -30,6 +31,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 ZAPRET_DIR = "/opt/zapret2"
 CONFIG = ZAPRET_DIR + "/config"
@@ -191,15 +193,39 @@ def nfqws_running():
     return run(["pgrep", "-x", "nfqws2"], stdout=subprocess.DEVNULL).returncode == 0
 
 
-def service_restart_checked():
-    service("stop")
-    if not service("start"):
-        return False
+def wait_nfqws():
     for _ in range(10):
         if nfqws_running():
             return True
         time.sleep(0.3)
     return False
+
+
+def service_restart_checked():
+    service("stop")
+    if has_systemd():
+        run(["systemctl", "reset-failed", "zapret2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return service("start") and wait_nfqws()
+
+
+INIT_SCRIPT = ZAPRET_DIR + "/init.d/sysv/zapret2"
+
+
+def trial_start():
+    """Start zapret2 with the current config for a quick test.
+
+    Uses zapret2's init script directly (what the systemd unit runs), so trying
+    several methods in a row doesn't hit systemd's start rate limit.
+    """
+    trial_stop()
+    if run([INIT_SCRIPT, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        trial_stop()
+        return False
+    return wait_nfqws()
+
+
+def trial_stop():
+    run([INIT_SCRIPT, "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def ipv6_works():
@@ -288,15 +314,14 @@ def apply_profile(tls_strategy):
     write_config(text)
 
 
-def add_user_domain(domain):
+def add_user_domains(domains):
     try:
         with open(USER_HOSTLIST) as f:
             entries = [l.strip() for l in f if l.strip()]
     except OSError:
         entries = []
     entries = [e for e in entries if e != "nonexistent.domain"]
-    if domain not in entries:
-        entries.append(domain)
+    entries += [d for d in domains if d not in entries]
     with open(USER_HOSTLIST, "w") as f:
         f.write("\n".join(entries) + "\n")
 
@@ -521,18 +546,45 @@ def run_blockcheck(domain, test, on_tested):
     return res
 
 
+MAX_DOMAINS = 10
+
+
 def site_reachable(domain):
-    r = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "8", "--retry", "1",
+    r = run(["curl", "-sS", "-o", "/dev/null", "--max-time", "6",
              "-A", "Mozilla", "https://" + domain + "/"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # 0 = any HTTP answer. 22 can't happen without -f. Other codes = blocked.
+    # 0 = any HTTP answer. Other codes mean the connection failed.
     return r.returncode == 0
 
 
-def cmd_blockcheck(raw_domain):
-    domain = normalize_domain(raw_domain)
-    if not domain:
-        raise Fail("domain", "That doesn't look like a website address. Try something like example.com.")
+def check_sites(domains):
+    """Which domains open right now, checked in parallel."""
+    with ThreadPoolExecutor(max_workers=min(8, len(domains))) as ex:
+        return [d for d, ok in zip(domains, ex.map(site_reachable, domains)) if ok]
+
+
+def join_names(names):
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def cmd_blockcheck(raw_domains):
+    """Find a method for one or more domains.
+
+    blockcheck only runs for the first domain that is actually blocked, which
+    keeps the search as fast as with a single domain. Every method it finds is
+    then tried on the real service against all domains (quick parallel checks),
+    and the one that opens the most of them is kept.
+    """
+    if not raw_domains:
+        raise Fail("domain", "No website given.")
+    domains = []
+    for raw in raw_domains[:MAX_DOMAINS]:
+        d = normalize_domain(raw)
+        if not d:
+            raise Fail("domain", f"\"{raw.strip()}\" doesn't look like a website address. "
+                                 "Try something like example.com.")
+        if d not in domains:
+            domains.append(d)
     if not zapret_installed():
         raise Fail("missing", "zapret2 is not installed.")
     for tools in (("curl",), ("nslookup", "host")):
@@ -540,6 +592,11 @@ def cmd_blockcheck(raw_domain):
             raise Fail("prereq", f"The program '{tools[0]}' is missing. Run install.sh again to fix this.")
 
     previous = read_config()
+    try:
+        with open(USER_HOSTLIST) as f:
+            previous_hosts = f.read()
+    except OSError:
+        previous_hosts = None
     state = load_state()
     was_running = nfqws_running()
     restored = False
@@ -550,12 +607,15 @@ def cmd_blockcheck(raw_domain):
             return
         restored = True
         write_config(previous)
+        if previous_hosts is not None:
+            with open(USER_HOSTLIST, "w") as f:
+                f.write(previous_hosts)
+        trial_stop()
         if was_running:
-            service("start")
+            service_restart_checked()
 
     event("step", id="stop", text="Pausing bypass while testing")
     service("stop")
-    # blockcheck needs every bypass off. Our own nfqws2 only; never touch others.
     time.sleep(0.5)
 
     tested = [0]
@@ -565,58 +625,83 @@ def cmd_blockcheck(raw_domain):
         event("progress", tested=tested[0])
 
     try:
-        event("step", id="search", text="Looking for a method that works for " + domain)
-        res = run_blockcheck(domain, "tls12", on_tested)
-        if not res["strategies"] and not res["unblocked"] and not res["aborted"]:
-            event("step", id="search13", text="Trying more methods")
-            res13 = run_blockcheck(domain, "tls13", on_tested)
-            if not res13["tls_unsupported"]:
-                res13["dns_spoofed"] = res13["dns_spoofed"] or res["dns_spoofed"]
-                res = res13
+        res = target = None
+        unblocked, unresolved, unreachable = [], [], []
+        dns_spoofed = False
+        for dom in domains:
+            event("step", id="search", text="Looking for a method that works for " + dom)
+            r = run_blockcheck(dom, "tls12", on_tested)
+            dns_spoofed = dns_spoofed or r["dns_spoofed"]
+            if r["unblocked"]:
+                log(f"{dom} is not blocked, trying the next website")
+                unblocked.append(dom)
+                continue
+            if r["aborted"]:
+                m = re.search(r"curl code (\d+)", r["aborted"])
+                (unresolved if m and m.group(1) == "6" else unreachable).append(dom)
+                continue
+            if not r["strategies"]:
+                event("step", id="search13", text="Trying more methods")
+                r13 = run_blockcheck(dom, "tls13", on_tested)
+                if not r13["tls_unsupported"]:
+                    dns_spoofed = dns_spoofed or r13["dns_spoofed"]
+                    r = r13
+            res, target = r, dom
+            break
 
-        if res["unblocked"]:
-            raise Fail("unblocked", f"{domain} opens fine without any help, so there is nothing to find. "
-                                    "Enter a website that does not open for you.")
-        if res["aborted"]:
-            m = re.search(r"curl code (\d+)", res["aborted"])
-            code = int(m.group(1)) if m else 0
-            if code == 6:
-                raise Fail("resolve", f"{domain} could not be found. Check the address for typos.")
-            raise Fail("unreachable", f"{domain} could not be reached at all. "
-                                      "Check your internet connection or try another website.")
+        if res is None:
+            if unblocked and not unresolved and not unreachable:
+                many = len(unblocked) > 1
+                raise Fail("unblocked", f"{join_names(unblocked)} {'open' if many else 'opens'} fine without "
+                                        "any help, so there is nothing to find. "
+                                        "Enter a website that does not open for you.")
+            parts = []
+            if unresolved:
+                parts.append(f"{join_names(unresolved)} could not be found. Check for typos.")
+            if unreachable:
+                parts.append(f"{join_names(unreachable)} could not be reached at all.")
+            if unblocked:
+                parts.append(f"{join_names(unblocked)} {'are' if len(unblocked) > 1 else 'is'} not blocked.")
+            code = "resolve" if unresolved and not unreachable else "unreachable"
+            raise Fail(code, " ".join(parts))
         if not res["strategies"]:
-            raise Fail("notfound", "No working method was found for " + domain + ". "
+            raise Fail("notfound", "No working method was found for " + target + ". "
                                    "Your provider may block it by address, which zapret2 cannot bypass.")
 
-        event("step", id="apply", text="Applying and checking")
-        add_user_domain(domain)
-        chosen = None
-        for strategy in res["strategies"][:5]:
+        event("step", id="apply", text="Checking the method with your websites" if len(domains) > 1
+              else "Applying and checking")
+        add_user_domains(domains)
+        best, best_ok, applied = None, [], None
+        for strategy in res["strategies"][:6]:
             log("trying: " + strategy)
             apply_profile(strategy)
-            if not service_restart_checked():
-                log("service did not start with this method")
+            applied = strategy
+            if not trial_start():
+                log("zapret2 did not start with this method")
                 continue
-            if site_reachable(domain):
-                chosen = strategy
+            ok = check_sites(domains)
+            log(f"opens {len(ok)} of {len(domains)}: {', '.join(ok) or 'none'}")
+            if best is None or len(ok) > len(best_ok):
+                best, best_ok = strategy, ok
+            if len(ok) == len(domains):
                 break
-            log(f"{domain} still not reachable with this method")
-        if not chosen:
-            # The site may just be slow to answer curl, or DNS is tampered with.
-            # Keep the best candidate running when it at least starts.
-            apply_profile(res["strategies"][0])
-            if service_restart_checked():
-                chosen = res["strategies"][0]
-        if not chosen:
+        trial_stop()
+        if best is None:
+            raise Fail("notfound", "A method was found but could not be applied. Please try again.")
+        if applied != best:
+            apply_profile(best)
+        if not service_restart_checked():
             raise Fail("notfound", "A method was found but could not be applied. Please try again.")
 
+        failing = [d for d in domains if d not in best_ok]
         service("enable")
         restored = True
-        state.update({"strategy": chosen, "domain": domain, "updated": int(time.time()),
-                      "enabled": True, "dns_spoofed": bool(res["dns_spoofed"])})
+        state.update({"strategy": best, "domain": target, "domains": domains, "working": best_ok,
+                      "failing": failing, "updated": int(time.time()), "enabled": True,
+                      "dns_spoofed": bool(dns_spoofed)})
         save_state(state)
-        event("done", message="Working method applied", domain=domain, strategy=chosen,
-              dns_spoofed=bool(res["dns_spoofed"]))
+        event("done", message="Working method applied", domains=domains, working=best_ok,
+              failing=failing, strategy=best, dns_spoofed=bool(dns_spoofed))
     finally:
         if not restored:
             restore()
@@ -688,9 +773,7 @@ def main(argv):
             if cmd == "install":
                 cmd_install()
             elif cmd == "blockcheck":
-                if len(args) != 2:
-                    raise Fail("domain", "No website given.")
-                cmd_blockcheck(args[1])
+                cmd_blockcheck(args[1:])
             elif cmd == "enable":
                 cmd_enable()
             elif cmd == "disable":

@@ -1,4 +1,5 @@
 #!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Privileged helper for Zapret2 GUI.
 
 Runs as root (through pkexec from the GUI, or sudo from install.sh/uninstall.sh).

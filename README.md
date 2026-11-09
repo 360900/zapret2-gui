@@ -27,3 +27,7 @@ Removes the app and zapret2 completely. Packages installed as dependencies are k
 - Root actions go through `pkexec` and a single helper in `/opt/zapret2-gui`.
 
 Requires systemd or OpenRC, GTK 4 and libadwaita 1.2 or newer.
+
+## License
+
+GPL-3.0-or-later

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Installs Zapret2 GUI and zapret2, then opens the app.
 set -eu
 

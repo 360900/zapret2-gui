@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Removes Zapret2 GUI and zapret2 completely.
 set -u
 

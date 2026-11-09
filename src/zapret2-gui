@@ -1,4 +1,5 @@
 #!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Zapret2 GUI: one-click DPI bypass setup on top of zapret2."""
 
 import json
@@ -698,6 +699,7 @@ class Window(Adw.ApplicationWindow):
         d.set_version(VERSION)
         d.set_comments("One-click DPI bypass for blocked websites, powered by zapret2.")
         d.set_website("https://github.com/bol-van/zapret2")
+        d.set_license_type(Gtk.License.GPL_3_0)
         d.present(self) if hasattr(Adw, "AboutDialog") else d.present()
 
     def _confirm(self, heading, body, ok, callback):

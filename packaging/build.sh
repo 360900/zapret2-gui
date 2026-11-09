@@ -15,7 +15,7 @@ mkdir -p dist
 # Source tarball for install.sh (also the AUR source).
 git archive --format=tar.gz --prefix="zapret2-gui-$VERSION/" -o "dist/zapret2-gui-$VERSION.tar.gz" HEAD
 
-nfpm() {
+run_nfpm() {
 	if command -v nfpm >/dev/null 2>&1; then
 		command nfpm "$@"
 	else
@@ -30,7 +30,7 @@ for p in deb rpm archlinux apk; do
 		archlinux) out=zapret2-gui.pkg.tar.zst ;;
 		apk) out=zapret2-gui.apk ;;
 	esac
-	nfpm package -f packaging/nfpm.yaml -p "$p" -t "dist/$out"
+	run_nfpm package -f packaging/nfpm.yaml -p "$p" -t "dist/$out"
 done
 
 (cd dist && sha256sum -- * > SHA256SUMS)

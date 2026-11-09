@@ -25,11 +25,20 @@ contents:
   - src: /opt/zapret2-gui/zapret2-gui
     dst: /usr/bin/zapret2-gui
     type: symlink
-  - src: data/zapret2-gui.desktop
-    dst: /usr/share/applications/zapret2-gui.desktop
+  - src: data/org.zapret2gui.App.desktop
+    dst: /usr/share/applications/org.zapret2gui.App.desktop
+    file_info: {mode: 0644}
+  # Starts in the tray at login. A config file, so deleting it to turn
+  # autostart off survives upgrades.
+  - src: data/zapret2-gui-autostart.desktop
+    dst: /etc/xdg/autostart/zapret2-gui.desktop
+    type: config|noreplace
     file_info: {mode: 0644}
   - src: data/zapret2-gui.svg
     dst: /usr/share/icons/hicolor/scalable/apps/zapret2-gui.svg
+    file_info: {mode: 0644}
+  - src: data/zapret2-gui-off.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/zapret2-gui-off.svg
     file_info: {mode: 0644}
   - src: data/org.zapret2gui.policy
     dst: /usr/share/polkit-1/actions/org.zapret2gui.policy

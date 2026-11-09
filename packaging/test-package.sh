@@ -33,7 +33,8 @@ esac
 
 echo "== checking installed files"
 for f in /usr/bin/zapret2-gui /opt/zapret2-gui/zapret2-gui /opt/zapret2-gui/zapret2-gui-helper \
-	/usr/share/applications/zapret2-gui.desktop /usr/share/icons/hicolor/scalable/apps/zapret2-gui.svg \
+	/usr/share/applications/org.zapret2gui.App.desktop /etc/xdg/autostart/zapret2-gui.desktop \
+	/usr/share/icons/hicolor/scalable/apps/zapret2-gui.svg /usr/share/icons/hicolor/scalable/apps/zapret2-gui-off.svg \
 	/usr/share/polkit-1/actions/org.zapret2gui.policy; do
 	[ -e "$f" ] || { echo "missing $f" >&2; exit 1; }
 done

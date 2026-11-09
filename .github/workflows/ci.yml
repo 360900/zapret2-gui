@@ -26,8 +26,8 @@ jobs:
           done
       - name: Desktop entry and polkit policy
         run: |
-          desktop-file-validate data/zapret2-gui.desktop
-          xmllint --noout data/org.zapret2gui.policy data/zapret2-gui.svg
+          desktop-file-validate data/*.desktop
+          xmllint --noout data/*.policy data/*.svg
 
   build:
     runs-on: ubuntu-latest

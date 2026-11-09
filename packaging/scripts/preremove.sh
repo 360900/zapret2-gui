@@ -8,7 +8,7 @@ case "${1:-}" in
 	0) ;;
 	*) exit 0 ;;
 esac
-pkill -f 'python3 -I [^ ]*/zapret2-gui$' 2>/dev/null || true
+pkill -f 'python3 -I [^ ]*/zapret2-gui( |$)' 2>/dev/null || true
 if [ -x /opt/zapret2-gui/zapret2-gui-helper ]; then
 	/opt/zapret2-gui/zapret2-gui-helper --plain uninstall || true
 fi

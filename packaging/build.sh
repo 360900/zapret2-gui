@@ -9,8 +9,8 @@ VERSION="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' src/zapret2-gui)"
 [ -n "$VERSION" ] || { echo "VERSION not found in src/zapret2-gui" >&2; exit 1; }
 export VERSION
 
-rm -rf dist
 mkdir -p dist
+find dist -mindepth 1 -delete
 
 # Source tarball for install.sh (also the AUR source).
 git archive --format=tar.gz --prefix="zapret2-gui-$VERSION/" -o "dist/zapret2-gui-$VERSION.tar.gz" HEAD

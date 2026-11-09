@@ -7,6 +7,7 @@ arch=('any')
 url='https://github.com/360900/zapret2-gui'
 license=('GPL-3.0-or-later')
 depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'curl' 'nftables' 'polkit' 'procps-ng' 'bind')
+backup=('etc/xdg/autostart/zapret2-gui.desktop')
 install=zapret2-gui.install
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -17,8 +18,10 @@ package() {
 	install -Dm755 src/zapret2-gui-helper "$pkgdir/opt/zapret2-gui/zapret2-gui-helper"
 	install -d "$pkgdir/usr/bin"
 	ln -s /opt/zapret2-gui/zapret2-gui "$pkgdir/usr/bin/zapret2-gui"
-	install -Dm644 data/zapret2-gui.desktop "$pkgdir/usr/share/applications/zapret2-gui.desktop"
+	install -Dm644 data/org.zapret2gui.App.desktop "$pkgdir/usr/share/applications/org.zapret2gui.App.desktop"
+	install -Dm644 data/zapret2-gui-autostart.desktop "$pkgdir/etc/xdg/autostart/zapret2-gui.desktop"
 	install -Dm644 data/zapret2-gui.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/zapret2-gui.svg"
+	install -Dm644 data/zapret2-gui-off.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/zapret2-gui-off.svg"
 	install -Dm644 data/org.zapret2gui.policy "$pkgdir/usr/share/polkit-1/actions/org.zapret2gui.policy"
 	install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

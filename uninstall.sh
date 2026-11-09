@@ -20,7 +20,7 @@ else
 fi
 
 say "Closing Zapret2"
-pkill -f 'python3 -I [^ ]*/zapret2-gui$' 2>/dev/null
+pkill -f 'python3 -I [^ ]*/zapret2-gui( |$)' 2>/dev/null
 
 say "Removing zapret2"
 if [ -x "$HELPER" ]; then
@@ -33,7 +33,10 @@ fi
 say "Removing Zapret2 GUI"
 $SUDO rm -f /usr/local/bin/zapret2-gui \
 	/usr/share/applications/zapret2-gui.desktop \
+	/usr/share/applications/org.zapret2gui.App.desktop \
+	/etc/xdg/autostart/zapret2-gui.desktop \
 	/usr/share/icons/hicolor/scalable/apps/zapret2-gui.svg \
+	/usr/share/icons/hicolor/scalable/apps/zapret2-gui-off.svg \
 	/usr/share/polkit-1/actions/org.zapret2gui.policy \
 	/run/zapret2-gui.lock
 $SUDO rm -rf "$APP_DIR" /var/lib/zapret2-gui

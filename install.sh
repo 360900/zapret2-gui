@@ -6,8 +6,9 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR=/opt/zapret2-gui
 BIN=/usr/local/bin/zapret2-gui
-DESKTOP=/usr/share/applications/zapret2-gui.desktop
-ICON=/usr/share/icons/hicolor/scalable/apps/zapret2-gui.svg
+DESKTOP=/usr/share/applications/org.zapret2gui.App.desktop
+AUTOSTART=/etc/xdg/autostart/zapret2-gui.desktop
+ICONS=/usr/share/icons/hicolor/scalable/apps
 POLICY=/usr/share/polkit-1/actions/org.zapret2gui.policy
 
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
@@ -78,10 +79,13 @@ $SUDO install -d -m 755 "$APP_DIR"
 $SUDO install -m 755 "$HERE/src/zapret2-gui" "$APP_DIR/zapret2-gui"
 $SUDO install -m 755 "$HERE/src/zapret2-gui-helper" "$APP_DIR/zapret2-gui-helper"
 $SUDO install -m 755 "$HERE/uninstall.sh" "$APP_DIR/uninstall.sh"
-$SUDO install -d -m 755 "$(dirname "$BIN")" "$(dirname "$DESKTOP")" "$(dirname "$ICON")" "$(dirname "$POLICY")"
+$SUDO install -d -m 755 "$(dirname "$BIN")" "$(dirname "$DESKTOP")" "$(dirname "$AUTOSTART")" "$ICONS" "$(dirname "$POLICY")"
 $SUDO ln -sf "$APP_DIR/zapret2-gui" "$BIN"
-$SUDO install -m 644 "$HERE/data/zapret2-gui.desktop" "$DESKTOP"
-$SUDO install -m 644 "$HERE/data/zapret2-gui.svg" "$ICON"
+$SUDO rm -f /usr/share/applications/zapret2-gui.desktop
+$SUDO install -m 644 "$HERE/data/org.zapret2gui.App.desktop" "$DESKTOP"
+$SUDO install -m 644 "$HERE/data/zapret2-gui-autostart.desktop" "$AUTOSTART"
+$SUDO install -m 644 "$HERE/data/zapret2-gui.svg" "$ICONS/zapret2-gui.svg"
+$SUDO install -m 644 "$HERE/data/zapret2-gui-off.svg" "$ICONS/zapret2-gui-off.svg"
 $SUDO install -m 644 "$HERE/data/org.zapret2gui.policy" "$POLICY"
 have update-desktop-database && $SUDO update-desktop-database -q /usr/share/applications 2>/dev/null || true
 have gtk-update-icon-cache && $SUDO gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true

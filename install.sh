@@ -101,8 +101,12 @@ $SUDO install -m 644 "$HERE/data/zapret2-gui-autostart.desktop" "$AUTOSTART"
 $SUDO install -m 644 "$HERE/data/zapret2-gui.svg" "$ICONS/zapret2-gui.svg"
 $SUDO install -m 644 "$HERE/data/zapret2-gui-off.svg" "$ICONS/zapret2-gui-off.svg"
 $SUDO install -m 644 "$HERE/data/org.zapret2gui.policy" "$POLICY"
-have update-desktop-database && $SUDO update-desktop-database -q /usr/share/applications 2>/dev/null || true
-have gtk-update-icon-cache && $SUDO gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+if have update-desktop-database; then
+	$SUDO update-desktop-database -q /usr/share/applications 2>/dev/null || true
+fi
+if have gtk-update-icon-cache; then
+	$SUDO gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+fi
 
 if [ -n "$UPDATE" ]; then
 	say "Updating zapret2"

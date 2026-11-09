@@ -1,6 +1,6 @@
 # Zapret2 GUI
 
-One-click DPI bypass for Linux. Type a website that is blocked for you, and Zapret2 GUI sets up [zapret2](https://github.com/bol-van/zapret2), finds a bypass method that works on your connection and keeps it running.
+One-click DPI bypass for Linux. Type the websites that are blocked for you, and Zapret2 GUI sets up [zapret2](https://github.com/bol-van/zapret2), finds a bypass method that works on your connection and keeps it running for all websites and apps.
 
 <p align="center">
   <picture>
@@ -13,15 +13,16 @@ One-click DPI bypass for Linux. Type a website that is blocked for you, and Zapr
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/home-dark.png">
-    <img alt="Websites are unblocked" src="docs/screenshots/home-light.png" width="32%">
+    <img alt="Unblocking is on" src="docs/screenshots/home-light.png" width="32%">
   </picture>
 </p>
 
 - No setup or knowledge needed: zapret2 is installed and configured for your system automatically.
 - Finds a working method with zapret2's own `blockcheck2` in its fastest mode.
+- Test several websites at once without making the search slower. For blocked apps, enter the website they use.
 - Bypass only applies to blocked sites (autohostlist), other sites are not touched.
-- On/off switch, starts with your computer.
-- Sites blocked again? Press **Find** to search for a new method.
+- Lives in the tray, starts with your computer. On/off from the tray menu.
+- Something blocked again? Press **Find** to search for a new method.
 
 ## Install
 
@@ -60,11 +61,15 @@ Packages and the install script pull these in automatically.
 
 ## Use
 
-1. Type a website that does not open for you.
+1. Type a website that does not open for you. Press **Add another website** for more. For a blocked app, type the website it uses, like `discord.com`.
 2. Press **Find a working method** and wait a few minutes.
-3. Done. Blocked websites open normally in any browser.
+3. Done. Blocked websites and apps work normally.
 
-If sites stop opening later, press **Find** to search again. The switch turns unblocking off and on.
+Closing the window keeps Zapret2 in the tray, and it starts there when you log in. Click the tray icon to open it, right-click for the on/off switch, a new search, or **Quit**. Unblocking itself is a system service, so it keeps working even when the app is closed.
+
+If something stops working later, press **Find** to search again.
+
+The tray needs a desktop with tray support: KDE Plasma, Cinnamon, XFCE, Budgie, LXQt and most others. On GNOME, install the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/) (Ubuntu has it by default). Without a tray, closing the window quits the app. To stop it starting at login, turn it off in your desktop's autostart settings or delete `/etc/xdg/autostart/zapret2-gui.desktop`.
 
 ## Uninstall
 
@@ -81,7 +86,7 @@ Uninstalling also stops and removes zapret2 and its firewall rules. Dependencies
 ## How it works
 
 - **Setup** downloads the latest zapret2 release, verifies its binaries against the release checksums and runs zapret2's `install_easy.sh` with every answer preset: nfqws2 on, autohostlist filtering, firewall type detected by zapret2, IPv6 only if it works, no list downloads, no flow offloading.
-- **Finding a method** pauses zapret2 and runs `blockcheck2.sh` in batch mode at the `veryquick` scan level against HTTPS (TLS 1.2, then TLS 1.3 if nothing works). The methods found are applied to the real service in order, and the first one that opens the website is kept. The website is added to zapret2's user host list. HTTP and QUIC keep zapret2's default methods.
+- **Finding a method** pauses zapret2 and runs `blockcheck2.sh` in batch mode at the `veryquick` scan level against HTTPS (TLS 1.2, then TLS 1.3 if nothing works). It only runs for the first website that is actually blocked, so extra websites don't slow it down. Each method found is then applied to zapret2 and checked against all websites in parallel; the first one that opens all of them is kept, otherwise the one that opens the most. The websites are added to zapret2's user host list. HTTP and QUIC keep zapret2's default methods.
 - **Cancel**, or closing the window, stops the test and restores the previous settings.
 - Root actions run through `pkexec` and one helper, `zapret2-gui-helper`. The GUI itself never runs as root.
 
@@ -89,22 +94,24 @@ Uninstalling also stops and removes zapret2 and its firewall rules. Dependencies
 |---|---|
 | `/opt/zapret2` | zapret2, config in `/opt/zapret2/config` |
 | `/opt/zapret2-gui` | the app and its root helper |
-| `/var/lib/zapret2-gui/state.json` | chosen method and website |
+| `/var/lib/zapret2-gui/state.json` | chosen method and websites |
+| `/etc/xdg/autostart/zapret2-gui.desktop` | starts the app in the tray at login |
 | `/usr/share/polkit-1/actions/org.zapret2gui.policy` | password prompt rules |
 
 ## Troubleshooting
 
-- **"This website isn't blocked"**: it opened without help. Enter a site that does not open for you.
+- **"Nothing to unblock"**: the websites opened without help. Enter one that does not open for you.
 - **"No working method found"**: your provider likely blocks the site by IP address. zapret2 cannot bypass that, a VPN can.
 - **DNS warning**: your provider may tamper with DNS answers. Turn on secure DNS (DNS over HTTPS) in your browser or system.
+- **"Still not opening"** under the status: the method works for your other websites but not for these. Press **Find** with only those websites to look for a method for them.
 - **More detail**: the working screen has a **Details** section with the full zapret2 output.
 
 ## Development
 
 ```
-src/zapret2-gui            GTK 4 / libadwaita app (Python)
+src/zapret2-gui            GTK 4 / libadwaita app with tray icon (Python)
 src/zapret2-gui-helper     root helper: install, blockcheck, enable, disable, uninstall
-data/                      desktop entry, icon, polkit policy
+data/                      desktop and autostart entries, icons, polkit policy
 install.sh, uninstall.sh   script install for any distro
 packaging/nfpm.yaml        deb, rpm, Arch and Alpine packages
 packaging/arch/            AUR PKGBUILD and update script
@@ -125,7 +132,7 @@ Test a package in a clean container:
 docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/packaging:/p:ro" fedora:latest sh /p/test-package.sh rpm-dnf /dist
 ```
 
-The helper also runs on its own as root, for example `sudo src/zapret2-gui-helper --plain blockcheck example.com`.
+The helper also runs on its own as root, for example `sudo src/zapret2-gui-helper --plain blockcheck example.com discord.com`.
 
 ### Releasing
 

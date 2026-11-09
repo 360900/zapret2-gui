@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Zapret2
+Comment=Start Zapret2 in the tray
+Exec=zapret2-gui --background
+Icon=zapret2-gui
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

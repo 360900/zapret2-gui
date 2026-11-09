@@ -9,4 +9,3 @@ Terminal=false
 Categories=Network;
 Keywords=zapret;dpi;censorship;unblock;bypass;
 StartupNotify=true
-StartupWMClass=org.zapret2gui.App

@@ -24,6 +24,8 @@ HELPER = os.path.join(HERE, "zapret2-gui-helper")
 STATE_FILE = "/var/lib/zapret2-gui/state.json"
 ZAPRET_DIR = "/opt/zapret2"
 ADW_MINOR = Adw.get_minor_version()
+MAX_DOMAINS = 10
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "zapret2-gui")
 
 
 # ------------------------------------------------------------------ oneDesign colors
@@ -207,6 +209,233 @@ class HelperRun:
         GLib.idle_add(self.on_exit, self, status)
 
 
+# ------------------------------------------------------------------ tray icon
+# StatusNotifierItem + com.canonical.dbusmenu over D-Bus. GTK 4 has no tray API.
+# Works on KDE Plasma, most other desktops, and GNOME with the AppIndicator
+# extension. Same approach as Nicotine+.
+
+SNI_XML = """<node>
+<interface name="org.kde.StatusNotifierItem">
+  <property name="Category" type="s" access="read"/>
+  <property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+  <property name="IconThemePath" type="s" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+  <property name="Menu" type="o" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/>
+  <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+  <method name="ProvideXdgActivationToken"><arg type="s" direction="in"/></method>
+  <signal name="NewIcon"/>
+  <signal name="NewTitle"/>
+  <signal name="NewToolTip"/>
+  <signal name="NewStatus"><arg type="s"/></signal>
+</interface>
+</node>"""
+
+MENU_XML = """<node>
+<interface name="com.canonical.dbusmenu">
+  <property name="Version" type="u" access="read"/>
+  <property name="TextDirection" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="IconThemePath" type="as" access="read"/>
+  <method name="GetLayout">
+    <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+    <arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/>
+  </method>
+  <method name="GetGroupProperties">
+    <arg type="ai" direction="in"/><arg type="as" direction="in"/>
+    <arg type="a(ia{sv})" direction="out"/>
+  </method>
+  <method name="GetProperty">
+    <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/>
+  </method>
+  <method name="Event">
+    <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/>
+    <arg type="u" direction="in"/>
+  </method>
+  <method name="EventGroup">
+    <arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/>
+  </method>
+  <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+  <method name="AboutToShowGroup">
+    <arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+  </method>
+  <signal name="ItemsPropertiesUpdated">
+    <arg type="a(ia{sv})"/><arg type="a(ias)"/>
+  </signal>
+  <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+  <signal name="ItemActivationRequested"><arg type="i"/><arg type="u"/></signal>
+</interface>
+</node>"""
+
+SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/StatusNotifierItem/menu"
+WATCHER = "org.kde.StatusNotifierWatcher"
+
+
+class Tray:
+    """Tray icon. `available` is True while a tray host shows it."""
+
+    def __init__(self, on_activate, on_change=None):
+        self.on_activate = on_activate
+        self.on_change = on_change
+        self.available = False
+        self.bus = None
+        self.reg_ids = []
+        self.icon = "zapret2-gui"
+        self.tooltip = APP_NAME
+        self.revision = 1
+        self.items = []  # list of dicts: id, label, callback, toggle, enabled, separator
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except GLib.Error:
+            return
+        self.sni_info = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        self.menu_info = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+        self.watch = Gio.bus_watch_name_on_connection(
+            self.bus, WATCHER, Gio.BusNameWatcherFlags.NONE, self._watcher_up, self._watcher_down)
+
+    # ---- menu model
+
+    def set_menu(self, items):
+        self.items = items
+        self.revision += 1
+        self._emit(MENU_PATH, "com.canonical.dbusmenu", "LayoutUpdated",
+                   GLib.Variant("(ui)", (self.revision, 0)))
+
+    def set_state(self, icon, tooltip):
+        if icon != self.icon:
+            self.icon = icon
+            self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewIcon", None)
+        if tooltip != self.tooltip:
+            self.tooltip = tooltip
+            self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewToolTip", None)
+            self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewTitle", None)
+
+    def _props(self, item):
+        if item.get("separator"):
+            return {"type": GLib.Variant("s", "separator")}
+        p = {"label": GLib.Variant("s", item["label"]),
+             "enabled": GLib.Variant("b", item.get("enabled", True)),
+             "visible": GLib.Variant("b", True)}
+        if "toggle" in item:
+            p["toggle-type"] = GLib.Variant("s", "checkmark")
+            p["toggle-state"] = GLib.Variant("i", 1 if item["toggle"] else 0)
+        return p
+
+    # ---- registration
+
+    def _watcher_up(self, *_a):
+        self._register()
+
+    def _watcher_down(self, *_a):
+        self._unregister()
+
+    def _register(self):
+        self._unregister()
+        try:
+            self.reg_ids = [
+                self.bus.register_object(MENU_PATH, self.menu_info, self._menu_call, self._menu_prop, None),
+                self.bus.register_object(SNI_PATH, self.sni_info, self._sni_call, self._sni_prop, None),
+            ]
+            self.bus.call_sync(WATCHER, "/StatusNotifierWatcher", WATCHER, "RegisterStatusNotifierItem",
+                               GLib.Variant("(s)", (self.bus.get_unique_name(),)), None,
+                               Gio.DBusCallFlags.NONE, 2000, None)
+        except GLib.Error:
+            self._unregister()
+            return
+        self.available = True
+        if self.on_change:
+            self.on_change(True)
+
+    def _unregister(self):
+        for rid in self.reg_ids:
+            self.bus.unregister_object(rid)
+        self.reg_ids = []
+        was = self.available
+        self.available = False
+        if was and self.on_change:
+            self.on_change(False)
+
+    def _emit(self, path, iface, name, params):
+        if not self.available:
+            return
+        try:
+            self.bus.emit_signal(None, path, iface, name, params)
+        except GLib.Error:
+            pass
+
+    # ---- org.kde.StatusNotifierItem
+
+    def _sni_prop(self, _c, _s, _p, _i, name):
+        values = {
+            "Category": GLib.Variant("s", "ApplicationStatus"),
+            "Id": GLib.Variant("s", "zapret2-gui"),
+            "Title": GLib.Variant("s", self.tooltip),
+            "Status": GLib.Variant("s", "Active"),
+            "IconName": GLib.Variant("s", self.icon),
+            "IconThemePath": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", (self.icon, [], APP_NAME, self.tooltip)),
+            "Menu": GLib.Variant("o", MENU_PATH),
+            "ItemIsMenu": GLib.Variant("b", False),
+        }
+        return values.get(name)
+
+    def _sni_call(self, _c, _s, _p, _i, method, params, invocation):
+        if method in ("Activate", "SecondaryActivate"):
+            GLib.idle_add(lambda: self.on_activate() and False)
+        invocation.return_value(None)
+
+    # ---- com.canonical.dbusmenu
+
+    def _menu_prop(self, _c, _s, _p, _i, name):
+        return {"Version": GLib.Variant("u", 3), "TextDirection": GLib.Variant("s", "ltr"),
+                "Status": GLib.Variant("s", "normal"), "IconThemePath": GLib.Variant("as", [])}.get(name)
+
+    def _layout(self):
+        children = [GLib.Variant("(ia{sv}av)", (it["id"], self._props(it), [])) for it in self.items]
+        return (0, {"children-display": GLib.Variant("s", "submenu")}, children)
+
+    def _menu_call(self, _c, _s, _p, _i, method, params, invocation):
+        if method == "GetLayout":
+            invocation.return_value(GLib.Variant("(u(ia{sv}av))", (self.revision, self._layout())))
+        elif method == "GetGroupProperties":
+            ids = params.unpack()[0]
+            res = [(it["id"], self._props(it)) for it in self.items if not ids or it["id"] in ids]
+            invocation.return_value(GLib.Variant("(a(ia{sv}))", (res,)))
+        elif method == "GetProperty":
+            iid, name = params.unpack()
+            it = next((i for i in self.items if i["id"] == iid), None)
+            val = self._props(it).get(name) if it else None
+            invocation.return_value(GLib.Variant("(v)", (val or GLib.Variant("s", ""),)))
+        elif method == "Event":
+            iid, ev = params.unpack()[:2]
+            if ev == "clicked":
+                self._click(iid)
+            invocation.return_value(None)
+        elif method == "EventGroup":
+            for iid, ev, _d, _t in params.unpack()[0]:
+                if ev == "clicked":
+                    self._click(iid)
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+        elif method == "AboutToShow":
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+        else:
+            invocation.return_value(None)
+
+    def _click(self, iid):
+        it = next((i for i in self.items if i["id"] == iid), None)
+        if it and it.get("callback") and it.get("enabled", True):
+            GLib.idle_add(lambda: it["callback"]() and False)
+
+
 # ------------------------------------------------------------------ UI helpers
 
 def label(text="", classes=(), wrap=True, xalign=0.5, selectable=False):
@@ -338,18 +567,21 @@ class Window(Adw.ApplicationWindow):
     def _build_welcome(self):
         sc, box = page_box()
         box.append(app_icon())
-        box.append(label("Unblock websites", ["title-1"]))
-        box.append(label("Type the address of a website that does not open for you. "
-                         "Zapret2 will try different ways around the block and keep the one that works. "
-                         "This takes a few minutes.", ["dim-label", "status-line"]))
-        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=18)
-        lst.add_css_class("boxed-list")
-        self.entry = Adw.EntryRow(title="Blocked website, for example example.com")
-        self.entry.set_input_purpose(Gtk.InputPurpose.URL)
-        self.entry.connect("entry-activated", lambda _e: self.start_blockcheck())
-        self.entry.connect("changed", lambda _e: self._update_start())
-        lst.append(self.entry)
-        box.append(lst)
+        box.append(label("Unblock websites and apps", ["title-1"]))
+        box.append(label("Type websites that don't open for you. For a blocked app, type the website "
+                         "it uses, like discord.com. Zapret2 tries different ways around the block and "
+                         "keeps the one that works. This takes a few minutes.",
+                         ["dim-label", "status-line"]))
+        self.domain_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=18)
+        self.domain_list.add_css_class("boxed-list")
+        self.entries = []
+        self.add_row = Adw.ActionRow(title="Add another website", activatable=True)
+        self.add_row.add_prefix(Gtk.Image(icon_name="list-add-symbolic"))
+        self.add_row.connect("activated", lambda _r: self.add_entry(focus=True))
+        self.domain_list.append(self.add_row)
+        self.add_entry()
+        box.append(self.domain_list)
+        box.append(label("Adding more websites does not make the search slower.", ["dim-label", "caption"]))
         self.entry_hint = label("", ["caption", "error"], xalign=0)
         self.entry_hint.set_visible(False)
         box.append(self.entry_hint)
@@ -363,6 +595,48 @@ class Window(Adw.ApplicationWindow):
         box.append(self.welcome_back)
         self.stack.add_named(sc, "welcome")
 
+    @property
+    def entry(self):
+        return self.entries[0]
+
+    def add_entry(self, text="", focus=False):
+        if len(self.entries) >= MAX_DOMAINS:
+            return None
+        first = not self.entries
+        row = Adw.EntryRow(title="Website, for example discord.com" if first else "Another website")
+        row.set_input_purpose(Gtk.InputPurpose.URL)
+        row.set_text(text)
+        row.connect("entry-activated", lambda _e: self.start_blockcheck())
+        row.connect("changed", lambda _e: self._update_start())
+        if not first:
+            rm = Gtk.Button(icon_name="list-remove-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Remove")
+            rm.add_css_class("flat")
+            rm.connect("clicked", lambda _b, r=row: self.remove_entry(r))
+            row.add_suffix(rm)
+        self.domain_list.insert(row, len(self.entries))
+        self.entries.append(row)
+        self.add_row.set_visible(len(self.entries) < MAX_DOMAINS)
+        self._update_start()
+        if focus:
+            row.grab_focus()
+        return row
+
+    def remove_entry(self, row):
+        if row in self.entries[1:]:
+            self.entries.remove(row)
+            self.domain_list.remove(row)
+            self.add_row.set_visible(True)
+            self._update_start()
+
+    def set_domains(self, domains):
+        for row in self.entries[1:]:
+            self.domain_list.remove(row)
+        del self.entries[1:]
+        self.entry.set_text(domains[0] if domains else "")
+        for d in domains[1:MAX_DOMAINS]:
+            self.add_entry(d)
+        self.add_row.set_visible(len(self.entries) < MAX_DOMAINS)
+
     def _build_working(self):
         sc, box = page_box()
         sp = make_spinner()
@@ -373,8 +647,8 @@ class Window(Adw.ApplicationWindow):
         box.append(self.work_title)
         self.work_sub = label("", ["dim-label", "status-line"])
         box.append(self.work_sub)
-        self.work_note = label("Keep this window open. You can keep using your computer.",
-                               ["dim-label", "caption"])
+        self.work_note = label("You can keep using your computer. Closing the window keeps this "
+                               "running in the tray.", ["dim-label", "caption"])
         box.append(self.work_note)
         self.cancel_btn = pill("Cancel", suggested=False)
         self.cancel_btn.set_margin_top(18)
@@ -416,7 +690,7 @@ class Window(Adw.ApplicationWindow):
         row.set_activatable_widget(self.switch)
         lst.append(row)
 
-        again = Adw.ActionRow(title="Websites blocked again?",
+        again = Adw.ActionRow(title="Something blocked again?",
                               subtitle="Find a new method that works")
         btn = Gtk.Button(label="Find", valign=Gtk.Align.CENTER)
         btn.add_css_class("suggested-action")
@@ -428,8 +702,8 @@ class Window(Adw.ApplicationWindow):
 
         self.dns_row = Adw.ActionRow(
             title="Your internet provider may be tampering with DNS",
-            subtitle="If websites still don't open, set a secure DNS such as 1.1.1.1 "
-                     "(DNS over HTTPS) in your browser or system settings.")
+            subtitle="If something still doesn't work, set a secure DNS such as 1.1.1.1 "
+                     "(DNS over HTTPS) in your system or browser settings.")
         self.dns_row.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
         self.dns_row.add_css_class("warning-row")
         dns_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=12)
@@ -483,22 +757,26 @@ class Window(Adw.ApplicationWindow):
         if on:
             self.home_hero.add_css_class("on")
             self.home_icon.set_from_icon_name("security-high-symbolic")
-            self.home_title.set_label("Websites are unblocked")
-            self.home_sub.set_label("Blocked websites should open normally in your browser.")
+            self.home_title.set_label("Unblocking is on")
+            self.home_sub.set_label("Blocked websites and apps should work normally now.")
         else:
             self.home_hero.remove_css_class("on")
             self.home_icon.set_from_icon_name("security-low-symbolic")
             self.home_title.set_label("Unblocking is off")
-            self.home_sub.set_label("Turn it on to open blocked websites.")
-        dom, when = st.get("domain"), fmt_date(st.get("updated"))
-        self.home_info.set_label(f"Method found on {when}, tested with {dom}" if dom and when else "")
+            self.home_sub.set_label("Turn it on to use blocked websites and apps.")
+        doms = st.get("domains") or ([st["domain"]] if st.get("domain") else [])
+        when = fmt_date(st.get("updated"))
+        info = f"Method found on {when}, tested with {', '.join(doms)}." if doms and when else ""
+        if st.get("failing"):
+            info += f" Still not opening in the last check: {', '.join(st['failing'])}."
+        self.home_info.set_label(info.strip())
         self.dns_list.set_visible(bool(st.get("dns_spoofed")))
         self.stack.set_visible_child_name("home")
 
     def show_welcome(self, first=False):
         st = load_state()
-        if not self.entry.get_text() and st.get("domain"):
-            self.entry.set_text(st["domain"])
+        if not any(e.get_text().strip() for e in self.entries):
+            self.set_domains(st.get("domains") or ([st["domain"]] if st.get("domain") else []))
         self.welcome_back.set_visible(not first and bool(st.get("strategy")))
         self.entry_hint.set_visible(False)
         self._update_start()
@@ -506,14 +784,15 @@ class Window(Adw.ApplicationWindow):
         self.entry.grab_focus()
 
     def _update_start(self):
-        self.start_btn.set_sensitive(bool(self.entry.get_text().strip()))
+        if hasattr(self, "start_btn"):
+            self.start_btn.set_sensitive(any(e.get_text().strip() for e in self.entries))
 
     def show_error(self, title, message, action="welcome", icon="dialog-warning-symbolic"):
         self.err_title.set_label(title)
         self.err_msg.set_label(message)
         self.err_icon.set_from_icon_name(icon)
         self.err_action = action
-        self.err_btn.set_label({"welcome": "Try another website", "install": "Try again",
+        self.err_btn.set_label({"welcome": "Change websites", "install": "Try again",
                                 "retry": "Try again"}.get(action, "Try again"))
         self.err_back.set_visible(zapret_installed() and bool(load_state().get("strategy")))
         self.stack.set_visible_child_name("error")
@@ -521,13 +800,23 @@ class Window(Adw.ApplicationWindow):
     def _err_action(self):
         if self.err_action == "install":
             self.start_install()
-        elif self.err_action == "retry" and self.entry.get_text().strip():
+        elif self.err_action == "retry" and any(e.get_text().strip() for e in self.entries):
             self.start_blockcheck()
         else:
             self.show_welcome()
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def notify(self, text):
+        """Desktop notification, only when the window is not visible."""
+        if self.get_visible():
+            return
+        n = Gio.Notification.new(APP_NAME)
+        n.set_body(text)
+        n.set_icon(Gio.ThemedIcon.new("zapret2-gui"))
+        n.set_default_action("app.show")
+        self.get_application().send_notification("result", n)
 
     # ---------------------------------------------------------- tasks
 
@@ -554,6 +843,7 @@ class Window(Adw.ApplicationWindow):
                             action="install" if task == "install" else "welcome")
             return
         self.timer = GLib.timeout_add_seconds(1, self._tick)
+        self.get_application().update_status()
 
     def _tick(self):
         if not self.run:
@@ -579,13 +869,24 @@ class Window(Adw.ApplicationWindow):
     def start_blockcheck(self):
         if self.run:
             return
-        dom = normalize_domain(self.entry.get_text())
-        if not dom:
-            self.entry_hint.set_label("Enter a website address like example.com")
-            self.entry_hint.set_visible(True)
+        doms = []
+        for row in list(self.entries):
+            text = row.get_text().strip()
+            if not text:
+                continue
+            dom = normalize_domain(text)
+            if not dom:
+                self.entry_hint.set_label(f"\"{text}\" is not a website address. Use something like example.com")
+                self.entry_hint.set_visible(True)
+                row.grab_focus()
+                return
+            row.set_text(dom)
+            if dom not in doms:
+                doms.append(dom)
+        if not doms:
             return
-        self.entry.set_text(dom)
-        self._begin("blockcheck", ["blockcheck", dom], "Looking for a working method")
+        self.entry_hint.set_visible(False)
+        self._begin("blockcheck", ["blockcheck"] + doms, "Looking for a working method")
 
     def on_switch(self, sw, _p):
         if self.switch_guard or self.run:
@@ -637,6 +938,7 @@ class Window(Adw.ApplicationWindow):
         task = self.task
         self.run = None
         self.task = None
+        GLib.idle_add(lambda: self.get_application().update_status() and False)
         self.menu_button.set_sensitive(True)
         if self.timer:
             GLib.source_remove(self.timer)
@@ -656,7 +958,13 @@ class Window(Adw.ApplicationWindow):
                 self.toast("Setup complete")
                 self.show_welcome(first=True)
             elif task == "blockcheck":
-                self.toast("Done! Blocked websites should open now")
+                failing, total = run.done.get("failing") or [], len(run.done.get("domains") or [])
+                if failing:
+                    msg = f"Done. Works for {total - len(failing)} of {total} websites"
+                else:
+                    msg = "Done! Blocked websites and apps should work now"
+                self.toast(msg)
+                self.notify(msg)
                 self.refresh()
             else:
                 self.refresh()
@@ -667,14 +975,16 @@ class Window(Adw.ApplicationWindow):
         if task == "install":
             self.show_error("Setup failed", msg, action="install")
         elif task == "blockcheck":
-            titles = {"unblocked": ("This website isn't blocked", "welcome", "dialog-information-symbolic"),
+            titles = {"unblocked": ("Nothing to unblock", "welcome", "dialog-information-symbolic"),
                       "notfound": ("No working method found", "welcome", "dialog-warning-symbolic"),
                       "resolve": ("Website not found", "welcome", "dialog-warning-symbolic"),
+                      "unreachable": ("Could not test", "welcome", "dialog-warning-symbolic"),
                       "domain": ("Check the address", "welcome", "dialog-warning-symbolic"),
                       "missing": ("Setup needed", "install", "dialog-warning-symbolic"),
                       "busy": ("Already running", "retry", "dialog-warning-symbolic")}
             title, action, icon = titles.get(code, ("Something went wrong", "retry", "dialog-warning-symbolic"))
             self.show_error(title, msg, action=action, icon=icon)
+            self.notify(title)
         else:
             self.toast(msg)
             self.refresh()
@@ -717,32 +1027,47 @@ class Window(Adw.ApplicationWindow):
         d.present(self) if hasattr(Adw, "AlertDialog") else d.present()
 
     def on_close_request(self, _w):
-        if self.run and self.task in ("install", "blockcheck") and not self.run.cancelled:
-            def stop_and_close():
-                if self.run:
-                    self.run.cancel()
-                self._close_when_idle()
-            self._confirm("Stop and quit?",
-                          "The current task will be stopped and your previous settings kept.",
-                          "Stop", stop_and_close)
+        app = self.get_application()
+        if app.tray.available:
+            # Keep running in the tray; a running task continues in the background.
+            self.set_visible(False)
+            app.hint_tray()
+            return True
+        if self.busy():
+            self.confirm_quit()
             return True
         return False
+
+    def busy(self):
+        return bool(self.run and self.task in ("install", "blockcheck") and not self.run.cancelled)
+
+    def confirm_quit(self):
+        def stop_and_quit():
+            if self.run:
+                self.run.cancel()
+            self._close_when_idle()
+        self._confirm("Stop and quit?",
+                      "The current task will be stopped and your previous settings kept.",
+                      "Stop", stop_and_quit)
 
     def _close_when_idle(self):
         def check():
             if self.run:
                 return True
-            self.destroy()
+            self.get_application().quit()
             return False
         GLib.timeout_add(200, check)
 
 
 class App(Adw.Application):
-    def __init__(self):
+    def __init__(self, background=False):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS
                          if hasattr(Gio.ApplicationFlags, "DEFAULT_FLAGS") else Gio.ApplicationFlags.FLAGS_NONE)
         self.css = None
         self.win = None
+        self.tray = None
+        self.background = background
+        self.last_status = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -751,6 +1076,13 @@ class App(Adw.Application):
         sm = Adw.StyleManager.get_default()
         sm.connect("notify::dark", lambda *_a: self._load_css())
         self._load_css()
+        for name, fn in (("show", self.show_window), ("quit", self.request_quit)):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a, f=fn: f())
+            self.add_action(act)
+        self.tray = Tray(self.toggle_window, self._tray_changed)
+        self.update_status()
+        GLib.timeout_add_seconds(5, lambda: self.update_status() or True)
 
     def _load_css(self):
         disp = Gdk.Display.get_default()
@@ -765,15 +1097,108 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(disp, self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     def do_activate(self):
+        first = self.win is None
+        if first:
+            self.win = Window(self)
+        if first and self.background:
+            # Started at login: stay in the tray. Without a tray there is nothing
+            # to show, and the bypass runs as a system service anyway, so quit.
+            GLib.timeout_add_seconds(30, self._background_check)
+            return
+        self.show_window()
+
+    def _background_check(self):
+        if not self.tray.available and not self.win.get_visible():
+            self.quit()
+        return False
+
+    def _tray_changed(self, available):
+        if not available and self.win and not self.win.get_visible():
+            # Tray went away while hidden: show the window so the app is reachable.
+            self.show_window()
+
+    # ---- window and tray actions
+
+    def show_window(self, welcome=False):
         if not self.win:
             self.win = Window(self)
+        if welcome and not self.win.run:
+            self.win.show_welcome()
+        elif not self.win.run:
+            self.win.refresh()
         self.win.present()
+
+    def toggle_window(self):
+        if self.win and self.win.get_visible():
+            self.win.set_visible(False)
+        else:
+            self.show_window()
+
+    def request_quit(self):
+        if self.win and self.win.busy():
+            self.show_window()
+            self.win.confirm_quit()
+            return
+        self.quit()
+
+    def toggle_unblocking(self):
+        if self.win and not self.win.run:
+            self.win.switch.set_active(not bypass_running())
+
+    def hint_tray(self):
+        """Tell the user once that closing keeps Zapret2 in the tray."""
+        flag = os.path.join(CONFIG_DIR, "tray-hint-shown")
+        if os.path.exists(flag):
+            return
+        n = Gio.Notification.new(APP_NAME)
+        n.set_body("Zapret2 keeps running in the tray. Right-click the tray icon to quit.")
+        n.set_icon(Gio.ThemedIcon.new("zapret2-gui"))
+        self.send_notification("tray-hint", n)
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            open(flag, "w").close()
+        except OSError:
+            pass
+
+    def update_status(self):
+        """Refresh tray icon, tooltip and menu from the system state."""
+        installed = zapret_installed()
+        st = load_state()
+        configured = installed and bool(st.get("strategy"))
+        on = configured and bypass_running()
+        busy = bool(self.win and self.win.run)
+        status = (installed, configured, on, busy, busy and self.win.work_title.get_label())
+        if status == self.last_status:
+            return
+        self.last_status = status
+        if busy:
+            tip = self.win.work_title.get_label() or "Working…"
+        elif not installed:
+            tip = "Setup needed"
+        elif not configured:
+            tip = "No method found yet"
+        else:
+            tip = "Unblocking is on" if on else "Unblocking is off"
+        self.tray.set_state("zapret2-gui" if on or busy else "zapret2-gui-off", tip)
+        self.tray.set_menu([
+            {"id": 1, "label": "Open Zapret2", "callback": self.show_window},
+            {"id": 2, "label": "Unblocking", "toggle": on, "enabled": configured and not busy,
+             "callback": self.toggle_unblocking},
+            {"id": 3, "label": "Find a new method…", "enabled": installed and not busy,
+             "callback": lambda: self.show_window(welcome=True)},
+            {"id": 4, "separator": True},
+            {"id": 5, "label": "Quit", "callback": self.request_quit},
+        ])
+        if self.win and self.win.get_visible() and not busy and \
+                self.win.stack.get_visible_child_name() == "home":
+            self.win.refresh()
 
 
 def main():
     if not shutil.which("pkexec"):
         print("pkexec (polkit) is required", file=sys.stderr)
-    return App().run(sys.argv)
+    args = [a for a in sys.argv if a != "--background"]
+    return App(background=len(args) != len(sys.argv)).run(args)
 
 
 if __name__ == "__main__":

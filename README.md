@@ -30,7 +30,7 @@ Pick the line for your system. All packages are also on the [releases page](http
 
 | System | Command |
 |---|---|
-| Arch, CachyOS, Manjaro, EndeavourOS | `yay -S zapret2-gui` (AUR) or<br>`sudo pacman -U https://github.com/360900/zapret2-gui/releases/latest/download/zapret2-gui.pkg.tar.zst` |
+| Arch, CachyOS, Manjaro, EndeavourOS | `sudo pacman -U https://github.com/360900/zapret2-gui/releases/latest/download/zapret2-gui.pkg.tar.zst` |
 | Debian 12+, Ubuntu 24.04+, Mint 22+, Pop!_OS | `curl -LO https://github.com/360900/zapret2-gui/releases/latest/download/zapret2-gui.deb && sudo apt install ./zapret2-gui.deb` |
 | Fedora, RHEL 10, Alma, Rocky | `sudo dnf install https://github.com/360900/zapret2-gui/releases/latest/download/zapret2-gui.rpm` |
 | openSUSE Tumbleweed | `sudo zypper install --allow-unsigned-rpm https://github.com/360900/zapret2-gui/releases/latest/download/zapret2-gui.rpm` |
@@ -53,7 +53,7 @@ Or download `zapret2-gui-<version>.tar.gz` from the releases page, unpack it and
 
 ### Update
 
-- **Packages**: update with your package manager as usual (AUR helper, `apt upgrade`, `dnf upgrade`).
+- **Packages**: run the install command for your system again to get the latest release.
 - **Install script**: run `git pull && ./install.sh` again.
 - **zapret2 itself**: choose **Update zapret2** in the app menu. The install script does this automatically.
 
@@ -85,7 +85,7 @@ Uninstalling also stops and removes zapret2 and its firewall rules. Dependencies
 
 | Installed with | Command |
 |---|---|
-| AUR or pacman | `sudo pacman -R zapret2-gui` |
+| pacman | `sudo pacman -R zapret2-gui` |
 | deb | `sudo apt remove zapret2-gui` |
 | rpm | `sudo dnf remove zapret2-gui` or `sudo zypper remove zapret2-gui` |
 | apk | `doas apk del zapret2-gui` |
@@ -123,7 +123,7 @@ src/zapret2-gui-helper     root helper: install, update, blockcheck, enable, dis
 data/                      desktop and autostart entries, icons, polkit policy
 install.sh, uninstall.sh   script install for any distro
 packaging/nfpm.yaml        deb, rpm, Arch and Alpine packages
-packaging/arch/            AUR PKGBUILD and update script
+packaging/arch/            PKGBUILD and AUR update script
 packaging/build.sh         builds dist/: source tarball, packages, SHA256SUMS
 packaging/test-package.sh  installs, checks and removes a package in a distro container
 .github/workflows/ci.yml   lint, build, test on 7 distros, release
@@ -148,7 +148,7 @@ The helper also runs on its own as root, for example `sudo src/zapret2-gui-helpe
 1. Set `VERSION` in `src/zapret2-gui` and commit.
 2. Tag and push: `git tag v1.2.3 && git push origin main v1.2.3`.
 
-CI checks that the tag matches `VERSION`, builds and tests every package, and publishes the GitHub release. If the `AUR_SSH_PRIVATE_KEY` secret is set, it also updates the AUR package.
+CI checks that the tag matches `VERSION`, builds and tests every package, and publishes the GitHub release.
 
 ## Credits
 

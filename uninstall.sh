@@ -8,6 +8,11 @@ HELPER="$APP_DIR/zapret2-gui-helper"
 
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 
+if [ -e /usr/bin/zapret2-gui ]; then
+	echo "Zapret2 GUI was installed from a package. Remove the zapret2-gui package with your package manager." >&2
+	exit 1
+fi
+
 if [ "$(id -u)" = 0 ]; then
 	SUDO=
 else

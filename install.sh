@@ -14,6 +14,7 @@ say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mError: %s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(uname)" = Linux ] || die "only Linux is supported"
+[ -e /usr/bin/zapret2-gui ] && die "Zapret2 GUI is already installed from a package. Update or remove it with your package manager."
 
 if [ "$(id -u)" = 0 ]; then
 	SUDO=

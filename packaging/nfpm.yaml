@@ -57,12 +57,13 @@ overrides:
       - procps
       - bind9-dnsutils | dnsutils
   rpm:
-    # Boolean deps and file paths resolve on both Fedora/RHEL and openSUSE.
+    # One rpm for Fedora/RHEL and openSUSE: conditional deps pick the right
+    # typelib packages, binaries are required by path.
     depends:
       - python3
       - python3-gobject
-      - (gtk4 or typelib-1_0-Gtk-4_0)
-      - (libadwaita or typelib-1_0-Adw-1)
+      - (typelib-1_0-Gtk-4_0 if openSUSE-release else gtk4)
+      - (typelib-1_0-Adw-1 if openSUSE-release else libadwaita)
       - curl
       - nftables
       - /usr/bin/pkexec

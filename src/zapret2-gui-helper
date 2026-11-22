@@ -20,6 +20,7 @@ Output: human readable log lines, plus machine events as lines starting with
 """
 
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -39,6 +40,7 @@ ZAPRET_DIR = "/opt/zapret2"
 CONFIG = ZAPRET_DIR + "/config"
 CONFIG_DEFAULT = ZAPRET_DIR + "/config.default"
 USER_HOSTLIST = ZAPRET_DIR + "/ipset/zapret-hosts-user.txt"
+USER_EXCLUDE = ZAPRET_DIR + "/ipset/zapret-hosts-user-exclude.txt"
 STATE_DIR = "/var/lib/zapret2-gui"
 STATE_FILE = STATE_DIR + "/state.json"
 LOCK_FILE = "/run/zapret2-gui.lock"
@@ -130,7 +132,7 @@ def has_systemd():
     return os.path.isdir("/run/systemd/system") and shutil.which("systemctl")
 
 
-def stream(cmd, env=None, timeout=None, on_line=None, cwd=None):
+def stream(cmd, env=None, timeout=None, on_line=None, cwd=None, skip=None):
     """Run cmd, forwarding its output line by line. Returns (exit code, lines)."""
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, env=env, cwd=cwd,
@@ -141,7 +143,8 @@ def stream(cmd, env=None, timeout=None, on_line=None, cwd=None):
         for raw in proc.stdout:
             line = raw.rstrip("\n")
             lines.append(line)
-            log(line)
+            if not skip or not skip(line):
+                log(line)
             if on_line:
                 on_line(line)
             if deadline and time.monotonic() > deadline:
@@ -622,7 +625,8 @@ def run_blockcheck(domain, test, on_tested):
             on_tested()
 
     code, lines = stream(["sh", ZAPRET_DIR + "/blockcheck2.sh"], env=env, timeout=3600,
-                         on_line=on_line, cwd=ZAPRET_DIR)
+                         on_line=on_line, cwd=ZAPRET_DIR,
+                         skip=lambda line: line.startswith("!!! WARNING."))
     res = {"code": code, "strategies": [], "unblocked": False, "aborted": None,
            "dns_spoofed": any("POSSIBLE DNS HIJACK DETECTED" in l for l in lines),
            "tls_unsupported": any("curl version does not support TLS 1.3" in l for l in lines)}
@@ -668,6 +672,29 @@ def join_names(names):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def reload_nfqws():
+    """Ask the running zapret2 to reload its host lists right away."""
+    pidfiles = {os.path.realpath(p) for p in
+                glob.glob("/run/nfqws2_*.pid") + glob.glob("/var/run/nfqws2_*.pid")}
+    reloaded = False
+    for pidfile in pidfiles:
+        try:
+            with open(pidfile) as f:
+                pid = int(f.read().strip())
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read()
+        except (OSError, ValueError):
+            continue
+        if b"nfqws2" in cmdline and USER_EXCLUDE.encode() in cmdline:
+            try:
+                os.kill(pid, signal.SIGHUP)
+                reloaded = True
+            except OSError:
+                pass
+    # The automatic reload when the file changes still applies.
+    return reloaded
+
+
 def cmd_blockcheck(raw_domains):
     """Find a method for one or more domains.
 
@@ -675,6 +702,10 @@ def cmd_blockcheck(raw_domains):
     keeps the search as fast as with a single domain. Every method it finds is
     then tried on the real service against all domains (quick parallel checks),
     and the one that opens the most of them is kept.
+
+    The method that was on stays on for the whole search: while blockcheck runs
+    its own tests, the tested sites are only excluded from zapret2's desync;
+    after that the previous or the best new method is started for every check.
     """
     if not raw_domains:
         raise Fail("domain", "No website given.")
@@ -698,27 +729,83 @@ def cmd_blockcheck(raw_domains):
             previous_hosts = f.read()
     except OSError:
         previous_hosts = None
+    try:
+        with open(USER_EXCLUDE) as f:
+            previous_exclude = f.read()
+    except OSError:
+        previous_exclude = None
     state = load_state()
     was_running = nfqws_running()
     restored = False
+    trial_used = False
+    excluded = False
+
+    def exclude_test_sites():
+        """Add the tested sites to zapret2's host exclude list for the search.
+
+        zapret2 keeps running with the current method for everything else,
+        while its desync is off for these sites, so blockcheck can use its own
+        firewall rules and test them cleanly.
+        """
+        nonlocal excluded
+        if not was_running or get_var(previous, "MODE_FILTER") not in ("autohostlist", "hostlist"):
+            return False
+        try:
+            with open(USER_EXCLUDE) as f:
+                current = f.read()
+        except OSError:
+            current = ""
+        entries = [line.strip() for line in current.splitlines() if line.strip()]
+        for name in list(domains) + ["iana.org"]:
+            if name not in entries:
+                entries.append(name)
+        try:
+            with open(USER_EXCLUDE, "w") as f:
+                f.write("\n".join(entries) + "\n")
+        except OSError:
+            return False
+        excluded = True
+        if not reload_nfqws():
+            return False
+        time.sleep(0.3)
+        return True
+
+    def clear_exclusions():
+        nonlocal excluded
+        if not excluded:
+            return
+        excluded = False
+        try:
+            if previous_exclude is None:
+                os.remove(USER_EXCLUDE)
+            else:
+                with open(USER_EXCLUDE, "w") as f:
+                    f.write(previous_exclude)
+        except OSError:
+            pass
+        reload_nfqws()
+
+    def start_trial():
+        nonlocal trial_used
+        trial_used = True
+        return trial_start()
 
     def restore():
         nonlocal restored
         if restored:
             return
         restored = True
+        clear_exclusions()
         write_config(previous)
         if previous_hosts is not None:
             with open(USER_HOSTLIST, "w") as f:
                 f.write(previous_hosts)
-        trial_stop()
-        if was_running:
+        if trial_used:
+            trial_stop()
+        if was_running and (trial_used or not nfqws_running()):
             service_restart_checked()
 
-    event("step", id="stop", text="Pausing bypass while testing")
-    service("stop")
-    time.sleep(0.5)
-
+    kept_running = False
     tested = [0]
 
     def on_tested():
@@ -726,11 +813,26 @@ def cmd_blockcheck(raw_domains):
         event("progress", tested=tested[0])
 
     try:
+        kept_running = exclude_test_sites()
+        if kept_running:
+            log("keeping the current method on while testing")
+            event("temporary", text="Your previous method stays on while the test runs. "
+                                   "Still looking for the best one.",
+                  short="Your previous method stays on. Still looking for the best one.")
+        else:
+            if was_running:
+                log("pausing the current method while testing")
+            clear_exclusions()
+            event("step", id="stop", text="Pausing bypass while testing")
+            service("stop")
+            time.sleep(0.5)
+
         res = target = None
         unblocked, unresolved, unreachable = [], [], []
         dns_spoofed = False
         for dom in domains:
-            event("step", id="search", text="Looking for a method that works for " + dom)
+            event("step", id="search", text=("Looking for a better method for " if kept_running
+                                            else "Looking for a method that works for ") + dom)
             r = run_blockcheck(dom, "tls12", on_tested)
             dns_spoofed = dns_spoofed or r["dns_spoofed"]
             if r["unblocked"]:
@@ -749,6 +851,10 @@ def cmd_blockcheck(raw_domains):
                     r = r13
             res, target = r, dom
             break
+
+        # From here on the websites must be handled by zapret2 again, so the
+        # methods found can be checked against them.
+        clear_exclusions()
 
         if res is None:
             if unblocked and not unresolved and not unreachable:
@@ -769,28 +875,69 @@ def cmd_blockcheck(raw_domains):
             raise Fail("notfound", "No working method was found for " + target + ". "
                                    "Your provider may block it by address, which zapret2 cannot bypass.")
 
-        event("step", id="apply", text="Checking the method with your websites" if len(domains) > 1
-              else "Applying and checking")
+        event("step", id="apply", text="Checking the methods found")
         add_user_domains(domains)
-        best, best_ok, applied = None, [], None
+
+        # Candidate methods are started through zapret2's init script, so the
+        # service must not run its own instance at the same time.
+        if was_running and nfqws_running():
+            service("stop")
+            time.sleep(0.5)
+
+        announced = False
+
+        def show_temporary(text, short=None):
+            """Tell the user that a method is on while the search continues."""
+            nonlocal announced
+            if not announced:
+                announced = True
+                event("step", id="best", text="Looking for the best method")
+            event("temporary", text=text, short=short or text)
+
+        def restart_previous():
+            write_config(previous)
+            return start_trial()
+
+        # Put the previous method back on for the checks below, so the search
+        # does not leave the user without unblocking while it continues.
+        if was_running and restart_previous():
+            show_temporary(("Your previous method is back on. Still looking for the best one."
+                            if kept_running else
+                            "Your previous method is on for now. Still looking for the best one."),
+                           short="Your previous method is on. Still looking for the best one.")
+        elif was_running:
+            log("could not put the previous method back on")
+
+        best, best_ok = None, []
         for strategy in res["strategies"][:6]:
             log("trying: " + strategy)
             apply_profile(strategy)
-            applied = strategy
-            if not trial_start():
+            if start_trial():
+                ok = check_sites(domains)
+                log(f"opens {len(ok)} of {len(domains)}: {', '.join(ok) or 'none'}")
+            else:
                 log("zapret2 did not start with this method")
-                continue
-            ok = check_sites(domains)
-            log(f"opens {len(ok)} of {len(domains)}: {', '.join(ok) or 'none'}")
-            if best is None or len(ok) > len(best_ok):
+                ok = []
+            if ok and (best is None or len(ok) > len(best_ok)):
                 best, best_ok = strategy, ok
-            if len(ok) == len(domains):
-                break
+                if len(ok) == len(domains):
+                    break
+                show_temporary("A working method is on for now. It works for "
+                               f"{len(ok)} of {len(domains)} websites. Still looking for the best one.",
+                               short="A working method is on. Still looking for the best one.")
+                continue
+            # Not better: put a known working method back on before the next
+            # candidate is tried, so unblocking stays as good as it gets.
+            if best is not None:
+                apply_profile(best)
+                if not start_trial():
+                    log("could not put the best method back on")
+            elif was_running and not restart_previous():
+                log("could not put the previous method back on")
         trial_stop()
         if best is None:
             raise Fail("notfound", "A method was found but could not be applied. Please try again.")
-        if applied != best:
-            apply_profile(best)
+        apply_profile(best)
         if not service_restart_checked():
             raise Fail("notfound", "A method was found but could not be applied. Please try again.")
 

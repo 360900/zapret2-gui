@@ -102,6 +102,7 @@ button.pill {{ border-radius: 999px; padding: 10px 28px; min-height: 20px; }}
 .hero.on image {{ color: {c['success']}; }}
 .hero image {{ color: alpha(currentColor, 0.55); }}
 .status-line {{ font-size: 14px; }}
+.temp-note {{ color: {c['success']}; }}
 .warning-row image {{ color: {c['warning']}; }}
 .logbox {{ border-radius: 14px; }}
 """
@@ -514,6 +515,7 @@ class Window(Adw.ApplicationWindow):
         self.tested = 0
         self.switch_guard = False
         self.authed = False
+        self.temp_informed = False
 
         self.toasts = Adw.ToastOverlay()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -647,6 +649,9 @@ class Window(Adw.ApplicationWindow):
         box.append(self.work_title)
         self.work_sub = label("", ["dim-label", "status-line"])
         box.append(self.work_sub)
+        self.work_info = label("", ["status-line", "temp-note"])
+        self.work_info.set_visible(False)
+        box.append(self.work_info)
         self.work_note = label("You can keep using your computer. Closing the window keeps this "
                                "running in the tray.", ["dim-label", "caption"])
         box.append(self.work_note)
@@ -810,7 +815,7 @@ class Window(Adw.ApplicationWindow):
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
 
-    def notify(self, text):
+    def notify(self, text, key="result"):
         """Desktop notification, only when the window is not visible."""
         if self.get_visible():
             return
@@ -818,7 +823,7 @@ class Window(Adw.ApplicationWindow):
         n.set_body(text)
         n.set_icon(Gio.ThemedIcon.new("zapret2-gui"))
         n.set_default_action("app.show")
-        self.get_application().send_notification("result", n)
+        self.get_application().send_notification(key, n)
 
     # ---------------------------------------------------------- tasks
 
@@ -826,9 +831,12 @@ class Window(Adw.ApplicationWindow):
         self.task = task
         self.tested = 0
         self.authed = False
+        self.temp_informed = False
         self.started = time.monotonic()
         self.log_buf.set_text("")
         self.work_title.set_label(title)
+        self.work_info.set_label("")
+        self.work_info.set_visible(False)
         self.work_sub.set_label("Waiting for your password…")
         self.cancel_btn.set_sensitive(True)
         self.cancel_btn.set_label("Cancel")
@@ -914,6 +922,21 @@ class Window(Adw.ApplicationWindow):
         elif kind == "progress":
             self.tested = int(ev.get("tested", 0))
             self._update_progress()
+        elif kind == "temporary" and self.run and not self.run.cancelled:
+            self._show_temporary(ev)
+
+    def _show_temporary(self, ev):
+        """A working method is on while a better one is still being searched."""
+        text = ev.get("text", "")
+        if not text:
+            return
+        self.work_info.set_label(text)
+        self.work_info.set_visible(True)
+        if not self.temp_informed:
+            self.temp_informed = True
+            short = ev.get("short") or text
+            self.toast(short)
+            self.notify(short, "temporary")
 
     def _authed(self):
         if not self.authed:

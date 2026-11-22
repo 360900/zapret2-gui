@@ -19,7 +19,9 @@ case $kind in
 		zypper --non-interactive --no-gpg-checks install --allow-unsigned-rpm "$dist/zapret2-gui.rpm"
 		;;
 	arch)
-		pacman -Sy --noconfirm
+		# A partial upgrade breaks pacman, and the image is often behind the
+		# repositories (package renames like openssl-3), so upgrade the system.
+		pacman -Syu --noconfirm
 		pacman -U --noconfirm "$dist/zapret2-gui.pkg.tar.zst"
 		;;
 	apk)

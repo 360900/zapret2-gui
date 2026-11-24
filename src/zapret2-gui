@@ -1032,7 +1032,7 @@ class Window(Adw.ApplicationWindow):
         d.set_application_name(APP_NAME)
         d.set_application_icon("zapret2-gui")
         d.set_version(VERSION)
-        d.set_comments("One-click DPI bypass for blocked websites, powered by zapret2.")
+        d.set_comments("One-click system-wide DPI bypass, powered by zapret2.")
         d.set_website("https://github.com/bol-van/zapret2")
         d.set_license_type(Gtk.License.GPL_3_0)
         d.present(self) if hasattr(Adw, "AboutDialog") else d.present()

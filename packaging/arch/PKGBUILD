@@ -2,7 +2,7 @@
 pkgname=zapret2-gui
 pkgver=1.1.0
 pkgrel=1
-pkgdesc='One-click DPI bypass for blocked websites, powered by zapret2'
+pkgdesc='One-click system-wide DPI bypass, powered by zapret2'
 arch=('any')
 url='https://github.com/360900/zapret2-gui'
 license=('GPL-3.0-or-later')

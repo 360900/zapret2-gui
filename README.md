@@ -5,7 +5,7 @@ One-click DPI bypass for Linux. Type the websites that are blocked for you, and 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/welcome-dark.png">
-    <img alt="Unblock websites" src="docs/screenshots/welcome-light.png" width="32%">
+    <img alt="Unblock websites and apps" src="docs/screenshots/welcome-light.png" width="32%">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/working-dark.png">
@@ -20,7 +20,7 @@ One-click DPI bypass for Linux. Type the websites that are blocked for you, and 
 - No setup or knowledge needed: zapret2 is installed and configured for your system automatically.
 - Finds a working method with zapret2's own `blockcheck2` in its fastest mode.
 - Test several websites at once without making the search slower. For blocked apps, enter the website they use.
-- Bypass only applies to blocked sites (autohostlist), other sites are not touched.
+- Bypass only applies to blocked hosts (autohostlist), other traffic is not touched.
 - Lives in the tray, starts with your computer. On/off from the tray menu.
 - Something blocked again? Press **Find** to search for a new method.
 

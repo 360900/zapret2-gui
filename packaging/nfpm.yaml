@@ -8,7 +8,7 @@ section: net
 priority: optional
 maintainer: 360900 <ziyad.koca@hotmail.com>
 description: |
-  One-click DPI bypass for blocked websites.
+  One-click system-wide DPI bypass.
   Installs and configures zapret2, finds a working bypass method with
   blockcheck2 and keeps it running.
 vendor: 360900
